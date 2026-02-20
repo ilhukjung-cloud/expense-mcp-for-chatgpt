@@ -1,0 +1,1085 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+import { v4 as uuidv4 } from "uuid";
+import * as XLSX from "xlsx";
+import puppeteer from "puppeteer";
+import { readFile, writeFile, mkdir, copyFile, readdir, stat } from "fs/promises";
+import { join, dirname, resolve } from "path";
+import { fileURLToPath } from "url";
+
+// ---------------------------------------------------------------------------
+// Paths & Constants
+// ---------------------------------------------------------------------------
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const GDRIVE_BASE = process.env.GDRIVE_BASE;
+const dataFile = () => join(GDRIVE_BASE, "expenses.json");
+const reportsDir = () => join(GDRIVE_BASE, "reports");
+
+// ---------------------------------------------------------------------------
+// Helper Functions
+// ---------------------------------------------------------------------------
+
+async function loadExpenses() {
+  try {
+    const raw = await readFile(dataFile(), "utf-8");
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
+async function saveExpenses(expenses) {
+  await writeFile(dataFile(), JSON.stringify(expenses, null, 2), "utf-8");
+}
+
+function detectCategory(merchant) {
+  const m = merchant;
+  if (/식당|음식|한식|중식|일식|분식|치킨|피자|카페|커피|정육/.test(m)) return "식비";
+  if (/택시|이동의즐거움|카카오T|우버|주유소|대리운전|톨게이트/.test(m)) return "교통비";
+  if (/호텔|숙박|모텔|에어비앤비|여관/.test(m)) return "숙박비";
+  if (/오피스디포|문구|다이소|사무용품/.test(m)) return "사무용품비";
+  if (/스타벅스|투썸|회의실/.test(m)) return "회의비";
+  return "기타";
+}
+
+function formatAmount(n) {
+  return n.toLocaleString("ko-KR") + "원";
+}
+
+// ---------------------------------------------------------------------------
+// MCP Server
+// ---------------------------------------------------------------------------
+
+const server = new McpServer({
+  name: "expense",
+  version: "1.0.0",
+});
+
+// ---- 1. save_expense -------------------------------------------------------
+
+server.tool(
+  "save_expense",
+  "경비 항목 하나를 저장합니다",
+  {
+    date: z.string().describe("날짜 (YYYY-MM-DD)"),
+    merchant: z.string().describe("가맹점/상호명"),
+    amount: z.number().describe("금액 (원)"),
+    business_number: z.string().optional().describe("사업자등록번호"),
+    category: z.string().optional().describe("분류 (미입력 시 자동 감지)"),
+    project: z.string().describe("경비 프로젝트명 (예: '출장 경비', '고객 지원 경비', 'AI 솔루션 활용 경비')"),
+    receipt_path: z.string().optional().describe("영수증 이미지 상대 경로"),
+    notes: z.string().optional().describe("비고"),
+  },
+  async ({ date, merchant, amount, business_number, category, project, receipt_path, notes }) => {
+    const expenses = await loadExpenses();
+
+    const expense = {
+      id: uuidv4(),
+      date,
+      merchant,
+      amount,
+      business_number: business_number || "",
+      category: category || detectCategory(merchant),
+      project,
+      receipt_path: receipt_path || "",
+      notes: notes || "",
+      created_at: new Date().toISOString(),
+    };
+
+    expenses.push(expense);
+    await saveExpenses(expenses);
+
+    // Calculate current month total
+    const [y, m] = date.split("-").map(Number);
+    const monthTotal = expenses
+      .filter((e) => {
+        const [ey, em] = e.date.split("-").map(Number);
+        return ey === y && em === m && e.project === project;
+      })
+      .reduce((sum, e) => sum + e.amount, 0);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: [
+            `저장 완료`,
+            ``,
+            `ID: ${expense.id}`,
+            `날짜: ${expense.date}`,
+            `가맹점: ${expense.merchant}`,
+            `금액: ${formatAmount(expense.amount)}`,
+            `프로젝트: ${expense.project}`,
+            `분류: ${expense.category}`,
+            expense.business_number ? `사업자등록번호: ${expense.business_number}` : null,
+            expense.receipt_path ? `영수증: ${expense.receipt_path}` : null,
+            expense.notes ? `비고: ${expense.notes}` : null,
+            ``,
+            `${y}년 ${m}월 [${project}] 누적 합계: ${formatAmount(monthTotal)}`,
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        },
+      ],
+    };
+  }
+);
+
+// ---- 2. list_expenses ------------------------------------------------------
+
+server.tool(
+  "list_expenses",
+  "경비 목록을 조회합니다 (필터 가능)",
+  {
+    year: z.number().optional().describe("연도"),
+    month: z.number().optional().describe("월"),
+    project: z.string().optional().describe("프로젝트명"),
+    category: z.string().optional().describe("분류"),
+  },
+  async ({ year, month, project, category }) => {
+    let expenses = await loadExpenses();
+
+    if (year) {
+      expenses = expenses.filter((e) => {
+        const ey = Number(e.date.split("-")[0]);
+        return ey === year;
+      });
+    }
+    if (month) {
+      expenses = expenses.filter((e) => {
+        const em = Number(e.date.split("-")[1]);
+        return em === month;
+      });
+    }
+    if (category) {
+      expenses = expenses.filter((e) => e.category === category);
+    }
+    if (project) {
+      expenses = expenses.filter((e) => e.project === project);
+    }
+
+    if (expenses.length === 0) {
+      return { content: [{ type: "text", text: "조회 결과가 없습니다." }] };
+    }
+
+    // Build table
+    const header = "| # | 프로젝트 | 날짜 | 가맹점 | 금액 | 분류 | 비고 |";
+    const divider = "|---|---------|------|--------|------|------|------|";
+    const rows = expenses.map(
+      (e, i) =>
+        `| ${i + 1} | ${e.project || ""} | ${e.date} | ${e.merchant} | ${formatAmount(e.amount)} | ${e.category} | ${e.notes || ""} |`
+    );
+
+    const total = expenses.reduce((s, e) => s + e.amount, 0);
+
+    const text = [
+      header,
+      divider,
+      ...rows,
+      "",
+      `총 ${expenses.length}건, 합계: ${formatAmount(total)}`,
+    ].join("\n");
+
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// ---- 3. get_summary --------------------------------------------------------
+
+server.tool(
+  "get_summary",
+  "월별 경비 요약 통계를 반환합니다",
+  {
+    year: z.number().describe("연도"),
+    month: z.number().describe("월"),
+    project: z.string().optional().describe("프로젝트명 (미입력 시 전체)"),
+  },
+  async ({ year, month, project }) => {
+    const all = await loadExpenses();
+    let filtered = all.filter((e) => {
+      const [ey, em] = e.date.split("-").map(Number);
+      return ey === year && em === month;
+    });
+    if (project) {
+      filtered = filtered.filter((e) => e.project === project);
+    }
+
+    const totalCount = filtered.length;
+    const totalAmount = filtered.reduce((s, e) => s + e.amount, 0);
+
+    // Category breakdown
+    const byCategory = {};
+    for (const e of filtered) {
+      if (!byCategory[e.category]) {
+        byCategory[e.category] = { count: 0, amount: 0 };
+      }
+      byCategory[e.category].count += 1;
+      byCategory[e.category].amount += e.amount;
+    }
+
+    const lines = [
+      `${year}년 ${month}월 경비 요약${project ? ` [${project}]` : ""}`,
+      ``,
+      `총 건수: ${totalCount}건`,
+      `총 금액: ${formatAmount(totalAmount)}`,
+      ``,
+      `분류별 내역:`,
+      `| 분류 | 건수 | 금액 | 비율 |`,
+      `|------|------|------|------|`,
+    ];
+
+    for (const [cat, data] of Object.entries(byCategory).sort((a, b) => b[1].amount - a[1].amount)) {
+      const pct = totalAmount > 0 ? ((data.amount / totalAmount) * 100).toFixed(1) : "0.0";
+      lines.push(`| ${cat} | ${data.count}건 | ${formatAmount(data.amount)} | ${pct}% |`);
+    }
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+// ---- 4. generate_excel_report ---------------------------------------------
+
+server.tool(
+  "generate_excel_report",
+  "월별 경비 Excel 보고서를 생성합니다",
+  {
+    year: z.number().describe("연도"),
+    month: z.number().describe("월"),
+    project: z.string().optional().describe("프로젝트명 (미입력 시 전체)"),
+  },
+  async ({ year, month, project }) => {
+    const all = await loadExpenses();
+    let filtered = all.filter((e) => {
+      const [ey, em] = e.date.split("-").map(Number);
+      return ey === year && em === month;
+    });
+    if (project) {
+      filtered = filtered.filter((e) => e.project === project);
+    }
+
+    // Ensure reports directory exists
+    await mkdir(reportsDir(), { recursive: true });
+
+    const wb = XLSX.utils.book_new();
+
+    // --- Detail sheet ---
+    const detailData = filtered.map((e) => ({
+      날짜: e.date,
+      가맹점: e.merchant,
+      금액: e.amount,
+      사업자등록번호: e.business_number,
+      분류: e.category,
+      비고: e.notes,
+    }));
+    const wsDetail = XLSX.utils.json_to_sheet(detailData);
+
+    // Set column widths
+    wsDetail["!cols"] = [
+      { wch: 12 }, // 날짜
+      { wch: 25 }, // 가맹점
+      { wch: 15 }, // 금액
+      { wch: 18 }, // 사업자등록번호
+      { wch: 12 }, // 분류
+      { wch: 20 }, // 비고
+    ];
+
+    XLSX.utils.book_append_sheet(wb, wsDetail, "경비내역");
+
+    // --- Summary sheet ---
+    const byCategory = {};
+    for (const e of filtered) {
+      if (!byCategory[e.category]) {
+        byCategory[e.category] = { count: 0, amount: 0 };
+      }
+      byCategory[e.category].count += 1;
+      byCategory[e.category].amount += e.amount;
+    }
+
+    const totalAmount = filtered.reduce((s, e) => s + e.amount, 0);
+
+    const summaryData = Object.entries(byCategory)
+      .sort((a, b) => b[1].amount - a[1].amount)
+      .map(([cat, data]) => ({
+        분류: cat,
+        건수: data.count,
+        금액: data.amount,
+        "비율(%)": totalAmount > 0 ? Number(((data.amount / totalAmount) * 100).toFixed(1)) : 0,
+      }));
+
+    // Add total row
+    summaryData.push({
+      분류: "합계",
+      건수: filtered.length,
+      금액: totalAmount,
+      "비율(%)": 100,
+    });
+
+    const wsSummary = XLSX.utils.json_to_sheet(summaryData);
+    wsSummary["!cols"] = [
+      { wch: 15 },
+      { wch: 10 },
+      { wch: 15 },
+      { wch: 10 },
+    ];
+
+    XLSX.utils.book_append_sheet(wb, wsSummary, "분류별요약");
+
+    const mm = String(month).padStart(2, "0");
+    const projectSuffix = project ? `_${project.replace(/\s+/g, "_")}` : "";
+    const fileName = `${year}-${mm}${projectSuffix}_경비보고서.xlsx`;
+    const filePath = join(reportsDir(), fileName);
+
+    XLSX.writeFile(wb, filePath);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: [
+            `Excel 보고서 생성 완료`,
+            ``,
+            `파일: ${filePath}`,
+            `기간: ${year}년 ${month}월`,
+            `건수: ${filtered.length}건`,
+            `합계: ${formatAmount(totalAmount)}`,
+          ].join("\n"),
+        },
+      ],
+    };
+  }
+);
+
+// ---- 5. generate_pdf_report ------------------------------------------------
+
+server.tool(
+  "generate_pdf_report",
+  "월별 경비 PDF 보고서를 영수증 이미지와 함께 생성합니다",
+  {
+    year: z.number().describe("연도"),
+    month: z.number().describe("월"),
+    project: z.string().optional().describe("프로젝트명 (미입력 시 전체)"),
+  },
+  async ({ year, month, project }) => {
+    const all = await loadExpenses();
+    let filtered = all.filter((e) => {
+      const [ey, em] = e.date.split("-").map(Number);
+      return ey === year && em === month;
+    });
+    if (project) {
+      filtered = filtered.filter((e) => e.project === project);
+    }
+
+    await mkdir(reportsDir(), { recursive: true });
+
+    // Read HTML template
+    const templatePath = resolve(__dirname, "..", "templates", "report.html");
+    let html = await readFile(templatePath, "utf-8");
+
+    const totalAmount = filtered.reduce((s, e) => s + e.amount, 0);
+
+    // Build expense rows HTML
+    const expenseRows = filtered
+      .map(
+        (e, i) => `
+      <tr>
+        <td>${i + 1}</td>
+        <td>${e.date}</td>
+        <td>${e.merchant}</td>
+        <td class="amount">${formatAmount(e.amount)}</td>
+        <td>${e.business_number}</td>
+        <td>${e.category}</td>
+        <td>${e.notes}</td>
+      </tr>`
+      )
+      .join("\n");
+
+    // Build category summary HTML
+    const byCategory = {};
+    for (const e of filtered) {
+      if (!byCategory[e.category]) {
+        byCategory[e.category] = { count: 0, amount: 0 };
+      }
+      byCategory[e.category].count += 1;
+      byCategory[e.category].amount += e.amount;
+    }
+
+    const categorySummary = Object.entries(byCategory)
+      .sort((a, b) => b[1].amount - a[1].amount)
+      .map(
+        ([cat, data]) => `
+      <tr>
+        <td>${cat}</td>
+        <td>${data.count}건</td>
+        <td class="amount">${formatAmount(data.amount)}</td>
+        <td>${totalAmount > 0 ? ((data.amount / totalAmount) * 100).toFixed(1) : "0.0"}%</td>
+      </tr>`
+      )
+      .join("\n");
+
+    // Build receipt images HTML as base64 data URIs
+    const receiptParts = [];
+    let receiptNo = 0;
+    for (const e of filtered) {
+      if (!e.receipt_path) continue;
+      receiptNo++;
+      const imgPath = join(GDRIVE_BASE, e.receipt_path);
+      try {
+        const imgBuffer = await readFile(imgPath);
+        const ext = e.receipt_path.split(".").pop().toLowerCase();
+        const mime =
+          ext === "png"
+            ? "image/png"
+            : ext === "jpg" || ext === "jpeg"
+              ? "image/jpeg"
+              : ext === "gif"
+                ? "image/gif"
+                : "image/png";
+        const b64 = imgBuffer.toString("base64");
+        receiptParts.push(`
+        <div class="receipt">
+          <div class="receipt-header">
+            <span class="receipt-no">증빙 #${receiptNo}</span>
+            <span class="receipt-info">${e.date} | ${e.merchant}${e.business_number ? ` | 사업자번호: ${e.business_number}` : ""} | ${e.category}</span>
+            <span class="receipt-amount">${formatAmount(e.amount)}</span>
+          </div>
+          <img src="data:${mime};base64,${b64}" alt="${e.merchant} 영수증" />
+        </div>`);
+      } catch {
+        receiptParts.push(`
+        <div class="receipt">
+          <div class="receipt-header">
+            <span class="receipt-no">증빙 #${receiptNo}</span>
+            <span class="receipt-info">${e.date} | ${e.merchant} | ${e.category}</span>
+            <span class="receipt-amount">${formatAmount(e.amount)}</span>
+          </div>
+          <p class="missing">영수증 이미지를 찾을 수 없습니다: ${e.receipt_path}</p>
+        </div>`);
+      }
+    }
+
+    const receiptImages = receiptParts.length > 0
+      ? receiptParts.join("\n")
+      : "<p>첨부된 영수증이 없습니다.</p>";
+
+    // Replace template placeholders
+    html = html.replace(/\{\{YEAR\}\}/g, String(year));
+    html = html.replace(/\{\{MONTH\}\}/g, String(month).padStart(2, "0"));
+    html = html.replace(/\{\{TOTAL_AMOUNT\}\}/g, formatAmount(totalAmount));
+    html = html.replace(/\{\{TOTAL_COUNT\}\}/g, String(filtered.length));
+    html = html.replace(/\{\{EXPENSE_ROWS\}\}/g, expenseRows);
+    html = html.replace(/\{\{CATEGORY_SUMMARY\}\}/g, categorySummary);
+    html = html.replace(/\{\{RECEIPT_IMAGES\}\}/g, receiptImages);
+    html = html.replace(/\{\{GENERATION_DATE\}\}/g, new Date().toLocaleString("ko-KR"));
+
+    // Generate PDF with puppeteer
+    const browser = await puppeteer.launch({ headless: true });
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: "networkidle0" });
+
+    const mm = String(month).padStart(2, "0");
+    const projectSuffix = project ? `_${project.replace(/\s+/g, "_")}` : "";
+    const fileName = `${year}-${mm}${projectSuffix}_경비보고서.pdf`;
+    const filePath = join(reportsDir(), fileName);
+
+    await page.pdf({
+      path: filePath,
+      format: "A4",
+      printBackground: true,
+      margin: { top: "15mm", right: "15mm", bottom: "15mm", left: "15mm" },
+    });
+
+    await browser.close();
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: [
+            `PDF 보고서 생성 완료`,
+            ``,
+            `파일: ${filePath}`,
+            `기간: ${year}년 ${month}월`,
+            `건수: ${filtered.length}건`,
+            `합계: ${formatAmount(totalAmount)}`,
+            receiptParts.length > 0
+              ? `영수증 이미지: ${receiptParts.length}장 포함`
+              : `영수증 이미지: 없음`,
+          ].join("\n"),
+        },
+      ],
+    };
+  }
+);
+
+// ---- 6. list_receipt_images ------------------------------------------------
+
+server.tool(
+  "list_receipt_images",
+  "Google Drive 경비 폴더의 영수증 이미지 목록을 반환합니다",
+  {
+    folder: z.string().optional().describe("폴더명 (예: '2월 경비'). 미입력 시 경비 관련 폴더 전체 검색"),
+  },
+  async ({ folder }) => {
+    const imageExts = [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".pdf"];
+
+    if (folder) {
+      // List images in specific folder
+      const folderPath = join(GDRIVE_BASE, folder);
+      try {
+        const files = await readdir(folderPath);
+        const images = files.filter((f) =>
+          imageExts.some((ext) => f.toLowerCase().endsWith(ext))
+        );
+
+        if (images.length === 0) {
+          return { content: [{ type: "text", text: `'${folder}' 폴더에 이미지가 없습니다.` }] };
+        }
+
+        const lines = images.map((f, i) => `${i + 1}. ${folder}/${f}`);
+        return {
+          content: [{ type: "text", text: [`'${folder}' 폴더 이미지 (${images.length}개):`, "", ...lines].join("\n") }],
+        };
+      } catch {
+        return {
+          content: [{ type: "text", text: `'${folder}' 폴더를 찾을 수 없습니다.` }],
+          isError: true,
+        };
+      }
+    }
+
+    // Search all expense-related folders
+    const allFiles = await readdir(GDRIVE_BASE);
+    const results = [];
+
+    for (const name of allFiles) {
+      if (/경비|출장|영수증|비용/.test(name)) {
+        const folderPath = join(GDRIVE_BASE, name);
+        try {
+          const s = await stat(folderPath);
+          if (!s.isDirectory()) continue;
+          const files = await readdir(folderPath);
+          const images = files.filter((f) =>
+            imageExts.some((ext) => f.toLowerCase().endsWith(ext))
+          );
+          if (images.length > 0) {
+            results.push(`📁 ${name}/ (${images.length}개)`);
+            for (const f of images) {
+              results.push(`   - ${name}/${f}`);
+            }
+          }
+        } catch {
+          // skip inaccessible folders
+        }
+      }
+    }
+
+    if (results.length === 0) {
+      return { content: [{ type: "text", text: "경비 관련 폴더에서 이미지를 찾을 수 없습니다." }] };
+    }
+
+    return {
+      content: [{ type: "text", text: [`Google Drive 영수증 이미지:`, "", ...results].join("\n") }],
+    };
+  }
+);
+
+// ---- 7. save_receipt_image -------------------------------------------------
+
+server.tool(
+  "save_receipt_image",
+  "로컬 이미지 파일을 Google Drive 경비 폴더로 복사하고 상대 경로를 반환합니다",
+  {
+    source_path: z.string().describe("복사할 원본 이미지의 절대 경로"),
+    folder: z.string().optional().describe("저장할 폴더명 (기본: '{월}월 경비')"),
+    filename: z.string().optional().describe("저장할 파일명 (기본: 원본 파일명)"),
+  },
+  async ({ source_path, folder, filename }) => {
+    // Default folder: current month
+    const now = new Date();
+    const month = now.getMonth() + 1;
+    const targetFolder = folder || `${month}월 경비`;
+    const targetDir = join(GDRIVE_BASE, targetFolder);
+
+    await mkdir(targetDir, { recursive: true });
+
+    // Default filename: same as source
+    const srcFilename = source_path.split("/").pop();
+    const targetFilename = filename || srcFilename;
+    const targetPath = join(targetDir, targetFilename);
+
+    try {
+      await copyFile(source_path, targetPath);
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `파일 복사 실패: ${err.message}\n원본: ${source_path}` }],
+        isError: true,
+      };
+    }
+
+    const relativePath = `${targetFolder}/${targetFilename}`;
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: [
+            `영수증 이미지 저장 완료`,
+            ``,
+            `원본: ${source_path}`,
+            `저장: ${targetPath}`,
+            `상대 경로: ${relativePath}`,
+            ``,
+            `save_expense 호출 시 receipt_path에 "${relativePath}"를 사용하세요.`,
+          ].join("\n"),
+        },
+      ],
+    };
+  }
+);
+
+// ---- 8. scan_receipt_folder ------------------------------------------------
+
+server.tool(
+  "scan_receipt_folder",
+  "영수증 폴더를 스캔하여 처리됨/미처리 상태를 구분합니다",
+  {
+    folder: z.string().describe("스캔할 폴더명 (예: '2월 경비')"),
+  },
+  async ({ folder }) => {
+    const folderPath = join(GDRIVE_BASE, folder);
+    const imageExts = [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".pdf"];
+
+    let files;
+    try {
+      files = await readdir(folderPath);
+    } catch {
+      return {
+        content: [{ type: "text", text: `'${folder}' 폴더를 찾을 수 없습니다.` }],
+        isError: true,
+      };
+    }
+
+    const images = files.filter((f) =>
+      imageExts.some((ext) => f.toLowerCase().endsWith(ext))
+    );
+
+    if (images.length === 0) {
+      return { content: [{ type: "text", text: `'${folder}' 폴더에 이미지가 없습니다.` }] };
+    }
+
+    const expenses = await loadExpenses();
+
+    const processed = [];
+    const unprocessed = [];
+
+    for (const img of images) {
+      const relativePath = `${folder}/${img}`;
+      const linked = expenses.find((e) => e.receipt_path === relativePath);
+      if (linked) {
+        processed.push({
+          file: img,
+          path: relativePath,
+          expense_id: linked.id,
+          date: linked.date,
+          merchant: linked.merchant,
+          amount: linked.amount,
+          business_number: linked.business_number,
+        });
+      } else {
+        unprocessed.push({ file: img, path: relativePath });
+      }
+    }
+
+    const lines = [];
+    lines.push(`📁 ${folder}/ 스캔 결과`);
+    lines.push(`전체: ${images.length}개 | 처리됨: ${processed.length}개 | 미처리: ${unprocessed.length}개`);
+    lines.push("");
+
+    if (unprocessed.length > 0) {
+      lines.push(`⬜ 미처리 (${unprocessed.length}개):`);
+      for (const u of unprocessed) {
+        lines.push(`  - ${u.file}`);
+      }
+      lines.push("");
+    }
+
+    if (processed.length > 0) {
+      lines.push(`✅ 처리됨 (${processed.length}개):`);
+      for (const p of processed) {
+        const biz = p.business_number ? ` | 사업자: ${p.business_number}` : "";
+        lines.push(`  - ${p.file} → ${p.date} ${p.merchant} ${formatAmount(p.amount)}${biz}`);
+      }
+    }
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+// ---- 9. lookup_by_receipt --------------------------------------------------
+
+server.tool(
+  "lookup_by_receipt",
+  "영수증 파일명 또는 경로로 경비 데이터를 조회합니다",
+  {
+    query: z.string().describe("검색할 영수증 파일명 또는 경로 (부분 일치 가능, 예: 'IMG_3672')"),
+  },
+  async ({ query }) => {
+    const expenses = await loadExpenses();
+    const matches = expenses.filter(
+      (e) => e.receipt_path && e.receipt_path.toLowerCase().includes(query.toLowerCase())
+    );
+
+    if (matches.length === 0) {
+      return {
+        content: [{ type: "text", text: `'${query}'와 일치하는 영수증 경비를 찾을 수 없습니다.` }],
+      };
+    }
+
+    const lines = [`'${query}' 검색 결과 (${matches.length}건):`, ""];
+    for (const e of matches) {
+      lines.push(`📎 ${e.receipt_path}`);
+      lines.push(`  ID: ${e.id}`);
+      lines.push(`  날짜: ${e.date}`);
+      lines.push(`  가맹점: ${e.merchant}`);
+      lines.push(`  금액: ${formatAmount(e.amount)}`);
+      if (e.business_number) lines.push(`  사업자번호: ${e.business_number}`);
+      lines.push(`  분류: ${e.category}`);
+      if (e.notes) lines.push(`  비고: ${e.notes}`);
+      lines.push("");
+    }
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+// ---- 10. list_projects -----------------------------------------------------
+
+server.tool(
+  "list_projects",
+  "등록된 경비 프로젝트 목록과 각 프로젝트별 요약을 반환합니다",
+  {
+    year: z.number().optional().describe("연도"),
+    month: z.number().optional().describe("월"),
+  },
+  async ({ year, month }) => {
+    let expenses = await loadExpenses();
+
+    if (year) {
+      expenses = expenses.filter((e) => Number(e.date.split("-")[0]) === year);
+    }
+    if (month) {
+      expenses = expenses.filter((e) => Number(e.date.split("-")[1]) === month);
+    }
+
+    const byProject = {};
+    for (const e of expenses) {
+      const p = e.project || "(미지정)";
+      if (!byProject[p]) {
+        byProject[p] = { count: 0, amount: 0 };
+      }
+      byProject[p].count += 1;
+      byProject[p].amount += e.amount;
+    }
+
+    if (Object.keys(byProject).length === 0) {
+      return { content: [{ type: "text", text: "등록된 프로젝트가 없습니다." }] };
+    }
+
+    const totalAmount = expenses.reduce((s, e) => s + e.amount, 0);
+
+    const lines = [
+      `프로젝트별 경비 현황${year ? ` (${year}년${month ? ` ${month}월` : ""})` : ""}:`,
+      "",
+      "| 프로젝트 | 건수 | 금액 | 비율 |",
+      "|---------|------|------|------|",
+    ];
+
+    for (const [proj, data] of Object.entries(byProject).sort((a, b) => b[1].amount - a[1].amount)) {
+      const pct = totalAmount > 0 ? ((data.amount / totalAmount) * 100).toFixed(1) : "0.0";
+      lines.push(`| ${proj} | ${data.count}건 | ${formatAmount(data.amount)} | ${pct}% |`);
+    }
+
+    lines.push("");
+    lines.push(`총 ${Object.keys(byProject).length}개 프로젝트, ${expenses.length}건, 합계: ${formatAmount(totalAmount)}`);
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+// ---- 11. update_expense -----------------------------------------------------
+
+server.tool(
+  "update_expense",
+  "기존 경비 항목을 수정합니다 (사업자번호, 영수증 경로 등 부분 업데이트 가능)",
+  {
+    id: z.string().describe("수정할 경비 항목의 ID"),
+    date: z.string().optional().describe("날짜 (YYYY-MM-DD)"),
+    merchant: z.string().optional().describe("가맹점/상호명"),
+    amount: z.number().optional().describe("금액 (원)"),
+    business_number: z.string().optional().describe("사업자등록번호"),
+    category: z.string().optional().describe("분류"),
+    project: z.string().optional().describe("경비 프로젝트명"),
+    receipt_path: z.string().optional().describe("영수증 이미지 상대 경로"),
+    notes: z.string().optional().describe("비고"),
+  },
+  async ({ id, date, merchant, amount, business_number, category, project, receipt_path, notes }) => {
+    const expenses = await loadExpenses();
+    const idx = expenses.findIndex((e) => e.id === id);
+
+    if (idx === -1) {
+      return {
+        content: [{ type: "text", text: `ID '${id}'에 해당하는 경비 항목을 찾을 수 없습니다.` }],
+        isError: true,
+      };
+    }
+
+    const before = { ...expenses[idx] };
+    const updates = [];
+
+    if (date !== undefined) { expenses[idx].date = date; updates.push(`날짜: ${before.date} → ${date}`); }
+    if (merchant !== undefined) { expenses[idx].merchant = merchant; updates.push(`가맹점: ${before.merchant} → ${merchant}`); }
+    if (amount !== undefined) { expenses[idx].amount = amount; updates.push(`금액: ${formatAmount(before.amount)} → ${formatAmount(amount)}`); }
+    if (business_number !== undefined) { expenses[idx].business_number = business_number; updates.push(`사업자번호: ${before.business_number || "(없음)"} → ${business_number}`); }
+    if (category !== undefined) { expenses[idx].category = category; updates.push(`분류: ${before.category} → ${category}`); }
+    if (project !== undefined) { expenses[idx].project = project; updates.push(`프로젝트: ${before.project || "(없음)"} → ${project}`); }
+    if (receipt_path !== undefined) { expenses[idx].receipt_path = receipt_path; updates.push(`영수증: ${before.receipt_path || "(없음)"} → ${receipt_path}`); }
+    if (notes !== undefined) { expenses[idx].notes = notes; updates.push(`비고: ${before.notes || "(없음)"} → ${notes}`); }
+
+    if (updates.length === 0) {
+      return { content: [{ type: "text", text: "수정할 항목이 없습니다." }] };
+    }
+
+    await saveExpenses(expenses);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: [
+            `수정 완료 (${updates.length}개 항목)`,
+            ``,
+            `ID: ${id}`,
+            `가맹점: ${expenses[idx].merchant}`,
+            ``,
+            `변경 내역:`,
+            ...updates.map((u) => `  - ${u}`),
+          ].join("\n"),
+        },
+      ],
+    };
+  }
+);
+
+// ---- 12. delete_expense -----------------------------------------------------
+
+server.tool(
+  "delete_expense",
+  "경비 항목을 ID로 삭제합니다",
+  {
+    id: z.string().describe("삭제할 경비 항목의 ID"),
+  },
+  async ({ id }) => {
+    const expenses = await loadExpenses();
+    const idx = expenses.findIndex((e) => e.id === id);
+
+    if (idx === -1) {
+      return {
+        content: [{ type: "text", text: `ID '${id}'에 해당하는 경비 항목을 찾을 수 없습니다.` }],
+        isError: true,
+      };
+    }
+
+    const [deleted] = expenses.splice(idx, 1);
+    await saveExpenses(expenses);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: [
+            `삭제 완료`,
+            ``,
+            `ID: ${deleted.id}`,
+            `날짜: ${deleted.date}`,
+            `가맹점: ${deleted.merchant}`,
+            `금액: ${formatAmount(deleted.amount)}`,
+            `분류: ${deleted.category}`,
+          ].join("\n"),
+        },
+      ],
+    };
+  }
+);
+
+// ---- 13. help ---------------------------------------------------------------
+
+server.tool(
+  "help",
+  "경비 관리 시스템의 사용법과 도구 목록을 안내합니다",
+  {
+    tool_name: z.string().optional().describe("특정 도구의 상세 사용법 (예: 'save_expense')"),
+  },
+  async ({ tool_name }) => {
+    const toolDetails = {
+      save_expense: {
+        summary: "경비 항목 하나를 저장합니다",
+        params: "date(필수), merchant(필수), amount(필수), project(필수), business_number, category, receipt_path, notes",
+        example: "날짜: 2026-02-05, 가맹점: 분당한우정육식당, 금액: 103500, 프로젝트: 출장 경비",
+        tips: "category 미입력 시 가맹점명으로 자동 분류됩니다. project는 반드시 지정해야 합니다.",
+      },
+      list_expenses: {
+        summary: "저장된 경비 목록을 조회합니다",
+        params: "year, month, category, project (모두 선택)",
+        example: "2월 경비 조회 → year: 2026, month: 2",
+        tips: "project 필터로 특정 프로젝트의 경비만 조회할 수 있습니다.",
+      },
+      get_summary: {
+        summary: "월별 경비 요약 통계를 조회합니다",
+        params: "year(필수), month(필수), project(선택)",
+        example: "year: 2026, month: 2 → 카테고리별 건수/금액 집계",
+        tips: "project 필터로 프로젝트별 요약도 가능합니다.",
+      },
+      generate_excel_report: {
+        summary: "월별 Excel 경비 보고서를 생성합니다",
+        params: "year(필수), month(필수), project(선택)",
+        example: "year: 2026, month: 2, project: 'AI 솔루션 활용 경비'",
+        tips: "project 지정 시 파일명에 프로젝트명이 포함됩니다. reports/ 폴더에 저장됩니다.",
+      },
+      generate_pdf_report: {
+        summary: "월별 PDF 경비 보고서를 생성합니다 (영수증 이미지 포함)",
+        params: "year(필수), month(필수), project(선택)",
+        example: "year: 2026, month: 2",
+        tips: "receipt_path가 설정된 경비만 영수증 이미지가 포함됩니다.",
+      },
+      list_receipt_images: {
+        summary: "Google Drive의 영수증 이미지 목록을 조회합니다",
+        params: "folder(선택, 기본값: '{M}월 경비')",
+        example: "folder: '2월 경비'",
+        tips: "폴더 내 PNG, JPG, PDF 파일을 목록으로 보여줍니다.",
+      },
+      save_receipt_image: {
+        summary: "로컬 이미지 파일을 Google Drive 경비 폴더로 복사합니다",
+        params: "source_path(필수), folder(선택)",
+        example: "source_path: '/tmp/receipt.png', folder: '2월 경비'",
+        tips: "이미 Google Drive에 있는 영수증은 이 도구가 필요 없습니다.",
+      },
+      scan_receipt_folder: {
+        summary: "영수증 폴더를 스캔하여 처리/미처리 상태를 확인합니다",
+        params: "folder(선택)",
+        example: "folder: '2월 경비' → 각 이미지의 처리 여부 표시",
+        tips: "expenses.json의 receipt_path와 대조하여 처리 상태를 판단합니다.",
+      },
+      lookup_by_receipt: {
+        summary: "영수증 파일명으로 경비를 검색합니다",
+        params: "filename(필수)",
+        example: "filename: 'IMG_3672.PNG'",
+        tips: "부분 일치로 검색됩니다.",
+      },
+      list_projects: {
+        summary: "프로젝트별 경비 요약을 조회합니다",
+        params: "year, month (모두 선택)",
+        example: "year: 2026, month: 2 → 프로젝트별 건수/금액",
+        tips: "어떤 프로젝트가 있는지, 각각의 금액이 얼마인지 한눈에 파악할 수 있습니다.",
+      },
+      update_expense: {
+        summary: "기존 경비 항목을 부분 수정합니다",
+        params: "id(필수), date, merchant, amount, business_number, category, project, receipt_path, notes (수정할 항목만)",
+        example: "id: '550e8400...', project: '출장 경비'",
+        tips: "프로젝트 변경, 사업자번호 추가, 영수증 연결 등에 사용합니다.",
+      },
+      delete_expense: {
+        summary: "경비 항목을 ID로 삭제합니다",
+        params: "id(필수)",
+        example: "id: '550e8400...'",
+        tips: "삭제 전 list_expenses로 ID를 확인하세요.",
+      },
+      help: {
+        summary: "이 도움말을 표시합니다",
+        params: "tool_name(선택)",
+        example: "tool_name: 'save_expense'",
+        tips: "도구명 없이 호출하면 전체 목록을, 도구명을 지정하면 상세 사용법을 보여줍니다.",
+      },
+    };
+
+    if (tool_name) {
+      const detail = toolDetails[tool_name];
+      if (!detail) {
+        return {
+          content: [{ type: "text", text: `'${tool_name}' 도구를 찾을 수 없습니다.\n\n사용 가능한 도구: ${Object.keys(toolDetails).join(", ")}` }],
+          isError: true,
+        };
+      }
+      return {
+        content: [{
+          type: "text",
+          text: [
+            `📌 ${tool_name}`,
+            ``,
+            `설명: ${detail.summary}`,
+            `파라미터: ${detail.params}`,
+            `사용 예: ${detail.example}`,
+            `팁: ${detail.tips}`,
+          ].join("\n"),
+        }],
+      };
+    }
+
+    const lines = [
+      "경비 관리 시스템 도구 안내",
+      "=".repeat(40),
+      "",
+      "📁 경비 등록/수정/삭제",
+      "  • save_expense    — 경비 1건 저장 (project 필수)",
+      "  • update_expense  — 기존 경비 수정 (부분 업데이트)",
+      "  • delete_expense  — 경비 삭제",
+      "",
+      "📊 조회/통계",
+      "  • list_expenses   — 경비 목록 조회 (project/월/카테고리 필터)",
+      "  • get_summary     — 월별 요약 통계",
+      "  • list_projects   — 프로젝트별 요약 (건수, 금액)",
+      "",
+      "📄 보고서 생성",
+      "  • generate_excel_report — Excel 보고서",
+      "  • generate_pdf_report   — PDF 보고서 (영수증 포함)",
+      "",
+      "🖼️ 영수증 관리",
+      "  • list_receipt_images  — 영수증 이미지 목록",
+      "  • save_receipt_image   — 로컬 이미지 → Google Drive 복사",
+      "  • scan_receipt_folder  — 폴더 스캔 (처리/미처리 상태)",
+      "  • lookup_by_receipt    — 영수증 파일명으로 경비 검색",
+      "",
+      "❓ 도움말",
+      "  • help — 사용법 안내 (tool_name 지정 시 상세 설명)",
+      "",
+      "💡 특정 도구의 상세 사용법: help(tool_name: '도구명')",
+    ];
+
+    return {
+      content: [{ type: "text", text: lines.join("\n") }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+async function main() {
+  if (!GDRIVE_BASE) {
+    console.error("Error: GDRIVE_BASE 환경 변수가 설정되지 않았습니다.");
+    console.error("예시: export GDRIVE_BASE='/Users/jay/Library/CloudStorage/GoogleDrive-.../내 드라이브'");
+    process.exit(1);
+  }
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
+
+main().catch((err) => {
+  console.error("서버 시작 실패:", err);
+  process.exit(1);
+});
