@@ -1,5 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+dotenv.config();
 import { z } from "zod";
 import { v4 as uuidv4 } from "uuid";
 import * as XLSX from "xlsx";
@@ -1065,21 +1069,49 @@ server.tool(
 );
 
 // ---------------------------------------------------------------------------
-// Main
+// HTTP Server (ChatGPT Enterprise / Streamable HTTP)
 // ---------------------------------------------------------------------------
 
-async function main() {
-  if (!GDRIVE_BASE) {
-    console.error("Error: GDRIVE_BASE 환경 변수가 설정되지 않았습니다.");
-    console.error("예시: export GDRIVE_BASE='/Users/jay/Library/CloudStorage/GoogleDrive-.../내 드라이브'");
-    process.exit(1);
-  }
-
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+if (!GDRIVE_BASE) {
+  console.error("Error: GDRIVE_BASE 환경 변수가 설정되지 않았습니다.");
+  console.error("예시: export GDRIVE_BASE='/Users/jay/Library/CloudStorage/GoogleDrive-.../내 드라이브'");
+  process.exit(1);
 }
 
-main().catch((err) => {
-  console.error("서버 시작 실패:", err);
-  process.exit(1);
+const app = express();
+
+app.use(cors({
+  origin: ["https://chatgpt.com", "https://chat.openai.com", "https://*.openai.com"],
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["content-type", "authorization"],
+}));
+
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+
+const transport = new StreamableHTTPServerTransport({
+  sessionIdGenerator: undefined, // stateless mode (ChatGPT Enterprise 권장)
+});
+
+await server.connect(transport);
+
+app.all("/mcp", async (req, res) => {
+  try {
+    await transport.handleRequest(req, res);
+  } catch (error) {
+    console.error("MCP Error:", error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Internal server error" });
+    }
+  }
+});
+
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", name: "expense-mcp-server" });
+});
+
+const PORT = process.env.PORT || 8787;
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Expense MCP Server running → http://0.0.0.0:${PORT}/mcp`);
+  console.log(`✅ ChatGPT Enterprise 연결 준비 완료`);
 });
