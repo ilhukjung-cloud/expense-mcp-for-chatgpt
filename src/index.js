@@ -1091,6 +1091,43 @@ app.get("/health", (req, res) => {
   });
 });
 
+app.get("/test-drive", async (req, res) => {
+  const result = { folder_id: process.env.GDRIVE_FOLDER_ID || "NOT SET", steps: [] };
+  try {
+    result.steps.push("1. 서비스 계정 키 파싱 시도");
+    const { google } = await import("googleapis");
+    const credentials = JSON.parse(
+      Buffer.from(process.env.GOOGLE_SERVICE_ACCOUNT_KEY, "base64").toString("utf-8")
+    );
+    result.service_account_email = credentials.client_email;
+    result.steps.push("2. 인증 완료");
+
+    const auth = new google.auth.GoogleAuth({ credentials, scopes: ["https://www.googleapis.com/auth/drive"] });
+    const drive = google.drive({ version: "v3", auth });
+    result.steps.push("3. Drive 클라이언트 생성 완료");
+
+    const folderRes = await drive.files.get({
+      fileId: process.env.GDRIVE_FOLDER_ID,
+      fields: "id, name, mimeType",
+    });
+    result.folder_name = folderRes.data.name;
+    result.steps.push("4. 폴더 접근 성공 ✅");
+
+    const fileList = await drive.files.list({
+      q: `'${process.env.GDRIVE_FOLDER_ID}' in parents and trashed=false`,
+      fields: "files(id, name)",
+      pageSize: 5,
+    });
+    result.files_in_folder = fileList.data.files.map(f => f.name);
+    result.steps.push("5. 파일 목록 조회 성공 ✅");
+    result.status = "OK";
+  } catch (err) {
+    result.error = err.message;
+    result.status = "FAILED";
+  }
+  res.json(result);
+});
+
 // ---------------------------------------------------------------------------
 // REST API (ChatGPT Custom GPT Actions)
 // ---------------------------------------------------------------------------
