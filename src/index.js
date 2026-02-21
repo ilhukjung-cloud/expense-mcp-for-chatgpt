@@ -8,9 +8,11 @@ import { z } from "zod";
 import { v4 as uuidv4 } from "uuid";
 import * as XLSX from "xlsx";
 import puppeteer from "puppeteer";
-import { readFile, writeFile, mkdir, copyFile, readdir, stat } from "fs/promises";
+import { readFile } from "fs/promises";
 import { join, dirname, resolve } from "path";
 import { fileURLToPath } from "url";
+import os from "os";
+import * as driveApi from "./drive.js";
 
 // ---------------------------------------------------------------------------
 // Paths & Constants
@@ -19,9 +21,7 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const GDRIVE_BASE = process.env.GDRIVE_BASE;
-const dataFile = () => join(GDRIVE_BASE, "expenses.json");
-const reportsDir = () => join(GDRIVE_BASE, "reports");
+// Google Drive API 방식 — GDRIVE_BASE 불필요
 
 // ---------------------------------------------------------------------------
 // Helper Functions
@@ -29,15 +29,15 @@ const reportsDir = () => join(GDRIVE_BASE, "reports");
 
 async function loadExpenses() {
   try {
-    const raw = await readFile(dataFile(), "utf-8");
-    return JSON.parse(raw);
+    const data = await driveApi.readJsonFile("expenses.json");
+    return data || [];
   } catch {
     return [];
   }
 }
 
 async function saveExpenses(expenses) {
-  await writeFile(dataFile(), JSON.stringify(expenses, null, 2), "utf-8");
+  await driveApi.writeJsonFile("expenses.json", expenses);
 }
 
 function detectCategory(merchant) {
@@ -265,9 +265,6 @@ server.tool(
       filtered = filtered.filter((e) => e.project === project);
     }
 
-    // Ensure reports directory exists
-    await mkdir(reportsDir(), { recursive: true });
-
     const wb = XLSX.utils.book_new();
 
     // --- Detail sheet ---
@@ -335,18 +332,26 @@ server.tool(
     const mm = String(month).padStart(2, "0");
     const projectSuffix = project ? `_${project.replace(/\s+/g, "_")}` : "";
     const fileName = `${year}-${mm}${projectSuffix}_경비보고서.xlsx`;
-    const filePath = join(reportsDir(), fileName);
 
-    XLSX.writeFile(wb, filePath);
+    // /tmp에 생성 후 Drive 업로드
+    const tmpPath = join(os.tmpdir(), fileName);
+    XLSX.writeFile(wb, tmpPath);
+
+    const reportsFolderId = await driveApi.findOrCreateFolder("reports");
+    await driveApi.uploadLocalFile(
+      tmpPath, fileName,
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      reportsFolderId
+    );
 
     return {
       content: [
         {
           type: "text",
           text: [
-            `Excel 보고서 생성 완료`,
+            `Excel 보고서 생성 완료 (Google Drive 저장)`,
             ``,
-            `파일: ${filePath}`,
+            `파일: reports/${fileName}`,
             `기간: ${year}년 ${month}월`,
             `건수: ${filtered.length}건`,
             `합계: ${formatAmount(totalAmount)}`,
@@ -376,8 +381,6 @@ server.tool(
     if (project) {
       filtered = filtered.filter((e) => e.project === project);
     }
-
-    await mkdir(reportsDir(), { recursive: true });
 
     // Read HTML template
     const templatePath = resolve(__dirname, "..", "templates", "report.html");
@@ -430,9 +433,10 @@ server.tool(
     for (const e of filtered) {
       if (!e.receipt_path) continue;
       receiptNo++;
-      const imgPath = join(GDRIVE_BASE, e.receipt_path);
       try {
-        const imgBuffer = await readFile(imgPath);
+        const imgFile = await driveApi.findFileByRelativePath(e.receipt_path);
+        if (!imgFile) throw new Error("not found");
+        const imgBuffer = await driveApi.downloadFileAsBuffer(imgFile.id);
         const ext = e.receipt_path.split(".").pop().toLowerCase();
         const mime =
           ext === "png"
@@ -487,25 +491,28 @@ server.tool(
     const mm = String(month).padStart(2, "0");
     const projectSuffix = project ? `_${project.replace(/\s+/g, "_")}` : "";
     const fileName = `${year}-${mm}${projectSuffix}_경비보고서.pdf`;
-    const filePath = join(reportsDir(), fileName);
 
+    // /tmp에 생성 후 Drive 업로드
+    const tmpPath = join(os.tmpdir(), fileName);
     await page.pdf({
-      path: filePath,
+      path: tmpPath,
       format: "A4",
       printBackground: true,
       margin: { top: "15mm", right: "15mm", bottom: "15mm", left: "15mm" },
     });
-
     await browser.close();
+
+    const reportsFolderId = await driveApi.findOrCreateFolder("reports");
+    await driveApi.uploadLocalFile(tmpPath, fileName, "application/pdf", reportsFolderId);
 
     return {
       content: [
         {
           type: "text",
           text: [
-            `PDF 보고서 생성 완료`,
+            `PDF 보고서 생성 완료 (Google Drive 저장)`,
             ``,
-            `파일: ${filePath}`,
+            `파일: reports/${fileName}`,
             `기간: ${year}년 ${month}월`,
             `건수: ${filtered.length}건`,
             `합계: ${formatAmount(totalAmount)}`,
@@ -531,52 +538,33 @@ server.tool(
     const imageExts = [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".pdf"];
 
     if (folder) {
-      // List images in specific folder
-      const folderPath = join(GDRIVE_BASE, folder);
-      try {
-        const files = await readdir(folderPath);
-        const images = files.filter((f) =>
-          imageExts.some((ext) => f.toLowerCase().endsWith(ext))
-        );
-
-        if (images.length === 0) {
-          return { content: [{ type: "text", text: `'${folder}' 폴더에 이미지가 없습니다.` }] };
-        }
-
-        const lines = images.map((f, i) => `${i + 1}. ${folder}/${f}`);
-        return {
-          content: [{ type: "text", text: [`'${folder}' 폴더 이미지 (${images.length}개):`, "", ...lines].join("\n") }],
-        };
-      } catch {
-        return {
-          content: [{ type: "text", text: `'${folder}' 폴더를 찾을 수 없습니다.` }],
-          isError: true,
-        };
+      const folderId = await driveApi.getFolderIdByName(folder);
+      if (!folderId) {
+        return { content: [{ type: "text", text: `'${folder}' 폴더를 찾을 수 없습니다.` }], isError: true };
       }
+      const files = await driveApi.listFilesInFolder(folderId);
+      const images = files.filter((f) => imageExts.some((ext) => f.name.toLowerCase().endsWith(ext)));
+
+      if (images.length === 0) {
+        return { content: [{ type: "text", text: `'${folder}' 폴더에 이미지가 없습니다.` }] };
+      }
+      const lines = images.map((f, i) => `${i + 1}. ${folder}/${f.name}`);
+      return {
+        content: [{ type: "text", text: [`'${folder}' 폴더 이미지 (${images.length}개):`, "", ...lines].join("\n") }],
+      };
     }
 
-    // Search all expense-related folders
-    const allFiles = await readdir(GDRIVE_BASE);
+    // 경비 관련 서브폴더 전체 검색
+    const subfolders = await driveApi.listSubfolders();
     const results = [];
 
-    for (const name of allFiles) {
-      if (/경비|출장|영수증|비용/.test(name)) {
-        const folderPath = join(GDRIVE_BASE, name);
-        try {
-          const s = await stat(folderPath);
-          if (!s.isDirectory()) continue;
-          const files = await readdir(folderPath);
-          const images = files.filter((f) =>
-            imageExts.some((ext) => f.toLowerCase().endsWith(ext))
-          );
-          if (images.length > 0) {
-            results.push(`📁 ${name}/ (${images.length}개)`);
-            for (const f of images) {
-              results.push(`   - ${name}/${f}`);
-            }
-          }
-        } catch {
-          // skip inaccessible folders
+    for (const sf of subfolders) {
+      if (/경비|출장|영수증|비용/.test(sf.name)) {
+        const files = await driveApi.listFilesInFolder(sf.id);
+        const images = files.filter((f) => imageExts.some((ext) => f.name.toLowerCase().endsWith(ext)));
+        if (images.length > 0) {
+          results.push(`📁 ${sf.name}/ (${images.length}개)`);
+          for (const f of images) results.push(`   - ${sf.name}/${f.name}`);
         }
       }
     }
@@ -584,9 +572,8 @@ server.tool(
     if (results.length === 0) {
       return { content: [{ type: "text", text: "경비 관련 폴더에서 이미지를 찾을 수 없습니다." }] };
     }
-
     return {
-      content: [{ type: "text", text: [`Google Drive 영수증 이미지:`, "", ...results].join("\n") }],
+      content: [{ type: "text", text: ["Google Drive 영수증 이미지:", "", ...results].join("\n") }],
     };
   }
 );
@@ -602,40 +589,31 @@ server.tool(
     filename: z.string().optional().describe("저장할 파일명 (기본: 원본 파일명)"),
   },
   async ({ source_path, folder, filename }) => {
-    // Default folder: current month
     const now = new Date();
     const month = now.getMonth() + 1;
     const targetFolder = folder || `${month}월 경비`;
-    const targetDir = join(GDRIVE_BASE, targetFolder);
-
-    await mkdir(targetDir, { recursive: true });
-
-    // Default filename: same as source
     const srcFilename = source_path.split("/").pop();
     const targetFilename = filename || srcFilename;
-    const targetPath = join(targetDir, targetFilename);
 
     try {
-      await copyFile(source_path, targetPath);
+      await driveApi.copyLocalImageToDrive(source_path, targetFilename, targetFolder);
     } catch (err) {
       return {
-        content: [{ type: "text", text: `파일 복사 실패: ${err.message}\n원본: ${source_path}` }],
+        content: [{ type: "text", text: `파일 업로드 실패: ${err.message}\n원본: ${source_path}` }],
         isError: true,
       };
     }
 
     const relativePath = `${targetFolder}/${targetFilename}`;
-
     return {
       content: [
         {
           type: "text",
           text: [
-            `영수증 이미지 저장 완료`,
+            `영수증 이미지 저장 완료 (Google Drive 업로드)`,
             ``,
             `원본: ${source_path}`,
-            `저장: ${targetPath}`,
-            `상대 경로: ${relativePath}`,
+            `Drive 저장 위치: ${relativePath}`,
             ``,
             `save_expense 호출 시 receipt_path에 "${relativePath}"를 사용하세요.`,
           ].join("\n"),
@@ -654,22 +632,18 @@ server.tool(
     folder: z.string().describe("스캔할 폴더명 (예: '2월 경비')"),
   },
   async ({ folder }) => {
-    const folderPath = join(GDRIVE_BASE, folder);
     const imageExts = [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".pdf"];
 
-    let files;
-    try {
-      files = await readdir(folderPath);
-    } catch {
+    const folderId = await driveApi.getFolderIdByName(folder);
+    if (!folderId) {
       return {
         content: [{ type: "text", text: `'${folder}' 폴더를 찾을 수 없습니다.` }],
         isError: true,
       };
     }
 
-    const images = files.filter((f) =>
-      imageExts.some((ext) => f.toLowerCase().endsWith(ext))
-    );
+    const allFiles = await driveApi.listFilesInFolder(folderId);
+    const images = allFiles.filter((f) => imageExts.some((ext) => f.name.toLowerCase().endsWith(ext)));
 
     if (images.length === 0) {
       return { content: [{ type: "text", text: `'${folder}' 폴더에 이미지가 없습니다.` }] };
@@ -681,11 +655,11 @@ server.tool(
     const unprocessed = [];
 
     for (const img of images) {
-      const relativePath = `${folder}/${img}`;
+      const relativePath = `${folder}/${img.name}`;
       const linked = expenses.find((e) => e.receipt_path === relativePath);
       if (linked) {
         processed.push({
-          file: img,
+          file: img.name,
           path: relativePath,
           expense_id: linked.id,
           date: linked.date,
@@ -694,7 +668,7 @@ server.tool(
           business_number: linked.business_number,
         });
       } else {
-        unprocessed.push({ file: img, path: relativePath });
+        unprocessed.push({ file: img.name, path: relativePath });
       }
     }
 
@@ -1098,9 +1072,6 @@ async function getTransport() {
 
 app.all("/mcp", async (req, res) => {
   try {
-    if (!GDRIVE_BASE) {
-      return res.status(500).json({ error: "GDRIVE_BASE 환경 변수가 설정되지 않았습니다." });
-    }
     const t = await getTransport();
     await t.handleRequest(req, res);
   } catch (error) {
@@ -1115,7 +1086,8 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     name: "expense-mcp-server",
-    gdrive: GDRIVE_BASE ? "configured" : "NOT SET",
+    mode: "Google Drive API",
+    folder: process.env.GDRIVE_FOLDER_ID ? "configured" : "NOT SET",
   });
 });
 
