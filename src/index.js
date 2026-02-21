@@ -1091,6 +1091,237 @@ app.get("/health", (req, res) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// REST API (ChatGPT Custom GPT Actions)
+// ---------------------------------------------------------------------------
+
+app.post("/api/save_expense", async (req, res) => {
+  try {
+    const { date, merchant, amount, business_number, category, project, receipt_path, notes } = req.body;
+    if (!date || !merchant || !amount || !project)
+      return res.status(400).json({ error: "date, merchant, amount, project 는 필수입니다." });
+    const expenses = await loadExpenses();
+    const expense = {
+      id: uuidv4(), date, merchant,
+      amount: Number(amount),
+      business_number: business_number || "",
+      category: category || detectCategory(merchant),
+      project, receipt_path: receipt_path || "",
+      notes: notes || "",
+      created_at: new Date().toISOString(),
+    };
+    expenses.push(expense);
+    await saveExpenses(expenses);
+    const [y, m] = date.split("-").map(Number);
+    const monthTotal = expenses
+      .filter(e => { const [ey, em] = e.date.split("-").map(Number); return ey === y && em === m && e.project === project; })
+      .reduce((s, e) => s + e.amount, 0);
+    res.json({ success: true, expense, month_total_formatted: formatAmount(monthTotal) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/api/list_expenses", async (req, res) => {
+  try {
+    let expenses = await loadExpenses();
+    const { year, month, project, category } = req.query;
+    if (year)     expenses = expenses.filter(e => Number(e.date.split("-")[0]) === Number(year));
+    if (month)    expenses = expenses.filter(e => Number(e.date.split("-")[1]) === Number(month));
+    if (category) expenses = expenses.filter(e => e.category === category);
+    if (project)  expenses = expenses.filter(e => e.project === project);
+    const total = expenses.reduce((s, e) => s + e.amount, 0);
+    res.json({ count: expenses.length, total_formatted: formatAmount(total), expenses });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/api/get_summary", async (req, res) => {
+  try {
+    const { year, month, project } = req.query;
+    if (!year || !month) return res.status(400).json({ error: "year, month 는 필수입니다." });
+    const all = await loadExpenses();
+    let filtered = all.filter(e => {
+      const [ey, em] = e.date.split("-").map(Number);
+      return ey === Number(year) && em === Number(month);
+    });
+    if (project) filtered = filtered.filter(e => e.project === project);
+    const totalAmount = filtered.reduce((s, e) => s + e.amount, 0);
+    const byCategory = {};
+    for (const e of filtered) {
+      if (!byCategory[e.category]) byCategory[e.category] = { count: 0, amount: 0 };
+      byCategory[e.category].count += 1;
+      byCategory[e.category].amount += e.amount;
+    }
+    const by_category = Object.entries(byCategory)
+      .sort((a, b) => b[1].amount - a[1].amount)
+      .map(([cat, d]) => ({ category: cat, count: d.count, amount_formatted: formatAmount(d.amount), ratio: totalAmount > 0 ? Number(((d.amount / totalAmount) * 100).toFixed(1)) : 0 }));
+    res.json({ year: Number(year), month: Number(month), project: project || "전체", total_count: filtered.length, total_formatted: formatAmount(totalAmount), by_category });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/api/list_projects", async (req, res) => {
+  try {
+    let expenses = await loadExpenses();
+    const { year, month } = req.query;
+    if (year)  expenses = expenses.filter(e => Number(e.date.split("-")[0]) === Number(year));
+    if (month) expenses = expenses.filter(e => Number(e.date.split("-")[1]) === Number(month));
+    const byProject = {};
+    for (const e of expenses) {
+      const p = e.project || "(미지정)";
+      if (!byProject[p]) byProject[p] = { count: 0, amount: 0 };
+      byProject[p].count += 1; byProject[p].amount += e.amount;
+    }
+    const totalAmount = expenses.reduce((s, e) => s + e.amount, 0);
+    const projects = Object.entries(byProject)
+      .sort((a, b) => b[1].amount - a[1].amount)
+      .map(([name, d]) => ({ name, count: d.count, amount_formatted: formatAmount(d.amount), ratio: totalAmount > 0 ? Number(((d.amount / totalAmount) * 100).toFixed(1)) : 0 }));
+    res.json({ project_count: projects.length, total_formatted: formatAmount(totalAmount), projects });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch("/api/expense/:id", async (req, res) => {
+  try {
+    const expenses = await loadExpenses();
+    const idx = expenses.findIndex(e => e.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: "해당 경비를 찾을 수 없습니다." });
+    for (const f of ["date","merchant","amount","business_number","category","project","receipt_path","notes"]) {
+      if (req.body[f] !== undefined) expenses[idx][f] = req.body[f];
+    }
+    await saveExpenses(expenses);
+    res.json({ success: true, expense: expenses[idx] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/api/expense/:id", async (req, res) => {
+  try {
+    const expenses = await loadExpenses();
+    const idx = expenses.findIndex(e => e.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: "해당 경비를 찾을 수 없습니다." });
+    const [deleted] = expenses.splice(idx, 1);
+    await saveExpenses(expenses);
+    res.json({ success: true, deleted });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/api/generate_excel_report", async (req, res) => {
+  try {
+    const { year, month, project } = req.body;
+    if (!year || !month) return res.status(400).json({ error: "year, month 는 필수입니다." });
+    const all = await loadExpenses();
+    let filtered = all.filter(e => { const [ey, em] = e.date.split("-").map(Number); return ey === Number(year) && em === Number(month); });
+    if (project) filtered = filtered.filter(e => e.project === project);
+    const wb = XLSX.utils.book_new();
+    const wsDetail = XLSX.utils.json_to_sheet(filtered.map(e => ({ 날짜: e.date, 가맹점: e.merchant, 금액: e.amount, 분류: e.category, 비고: e.notes })));
+    XLSX.utils.book_append_sheet(wb, wsDetail, "경비내역");
+    const mm = String(month).padStart(2, "0");
+    const suffix = project ? `_${project.replace(/\s+/g, "_")}` : "";
+    const fileName = `${year}-${mm}${suffix}_경비보고서.xlsx`;
+    const tmpPath = join(os.tmpdir(), fileName);
+    XLSX.writeFile(wb, tmpPath);
+    const folderId = await driveApi.findOrCreateFolder("reports");
+    await driveApi.uploadLocalFile(tmpPath, fileName, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", folderId);
+    res.json({ success: true, file: `reports/${fileName}`, count: filtered.length, total_formatted: formatAmount(filtered.reduce((s, e) => s + e.amount, 0)) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ---------------------------------------------------------------------------
+// OpenAPI Schema (ChatGPT "URL 가져오기" 전용)
+// ---------------------------------------------------------------------------
+
+app.get("/openapi.json", (req, res) => {
+  const BASE = "https://expense-mcp-for-chatgpt.vercel.app";
+  res.json({
+    openapi: "3.1.0",
+    info: { title: "경비 관리 시스템", version: "1.0.0", description: "ChatGPT Enterprise용 경비 관리 도구 - 경비 저장, 조회, 보고서 생성" },
+    servers: [{ url: BASE }],
+    paths: {
+      "/api/save_expense": {
+        post: {
+          operationId: "save_expense",
+          summary: "경비 저장",
+          description: "경비 항목 하나를 저장합니다",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { type: "object", required: ["date","merchant","amount","project"], properties: {
+              date: { type: "string", description: "날짜 (YYYY-MM-DD)" },
+              merchant: { type: "string", description: "가맹점명" },
+              amount: { type: "number", description: "금액 (원)" },
+              project: { type: "string", description: "프로젝트명" },
+              business_number: { type: "string", description: "사업자등록번호" },
+              category: { type: "string", description: "분류 (미입력 시 자동)" },
+              receipt_path: { type: "string", description: "영수증 경로" },
+              notes: { type: "string", description: "비고" },
+            }}}}
+          },
+          responses: { "200": { description: "저장 성공" } }
+        }
+      },
+      "/api/list_expenses": {
+        get: {
+          operationId: "list_expenses",
+          summary: "경비 목록 조회",
+          parameters: [
+            { name: "year", in: "query", schema: { type: "integer" }, description: "연도" },
+            { name: "month", in: "query", schema: { type: "integer" }, description: "월" },
+            { name: "project", in: "query", schema: { type: "string" }, description: "프로젝트명" },
+            { name: "category", in: "query", schema: { type: "string" }, description: "분류" },
+          ],
+          responses: { "200": { description: "경비 목록" } }
+        }
+      },
+      "/api/get_summary": {
+        get: {
+          operationId: "get_summary",
+          summary: "월별 경비 요약",
+          parameters: [
+            { name: "year", in: "query", required: true, schema: { type: "integer" } },
+            { name: "month", in: "query", required: true, schema: { type: "integer" } },
+            { name: "project", in: "query", schema: { type: "string" } },
+          ],
+          responses: { "200": { description: "요약 통계" } }
+        }
+      },
+      "/api/list_projects": {
+        get: {
+          operationId: "list_projects",
+          summary: "프로젝트별 경비 현황",
+          parameters: [
+            { name: "year", in: "query", schema: { type: "integer" } },
+            { name: "month", in: "query", schema: { type: "integer" } },
+          ],
+          responses: { "200": { description: "프로젝트 목록" } }
+        }
+      },
+      "/api/expense/{id}": {
+        patch: {
+          operationId: "update_expense",
+          summary: "경비 수정",
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          requestBody: { content: { "application/json": { schema: { type: "object", properties: {
+            date: { type: "string" }, merchant: { type: "string" }, amount: { type: "number" },
+            category: { type: "string" }, project: { type: "string" }, notes: { type: "string" },
+          }}}}},
+          responses: { "200": { description: "수정 성공" } }
+        },
+        delete: {
+          operationId: "delete_expense",
+          summary: "경비 삭제",
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          responses: { "200": { description: "삭제 성공" } }
+        }
+      },
+      "/api/generate_excel_report": {
+        post: {
+          operationId: "generate_excel_report",
+          summary: "Excel 보고서 생성",
+          requestBody: { required: true, content: { "application/json": { schema: { type: "object", required: ["year","month"], properties: {
+            year: { type: "integer" }, month: { type: "integer" }, project: { type: "string" }
+          }}}}},
+          responses: { "200": { description: "보고서 생성 완료" } }
+        }
+      }
+    }
+  });
+});
+
 // 로컬 실행 시에만 서버 시작 (Vercel은 export default app 사용)
 if (!process.env.VERCEL) {
   const PORT = process.env.PORT || 8787;
