@@ -7,16 +7,28 @@ import { Readable } from "stream";
 // ---------------------------------------------------------------------------
 
 function getAuth() {
-  if (!process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
-    throw new Error("GOOGLE_SERVICE_ACCOUNT_KEY 환경 변수가 설정되지 않았습니다.");
+  // OAuth2 방식 (개인 Drive용, 우선)
+  if (process.env.GOOGLE_REFRESH_TOKEN) {
+    const oauth2 = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET
+    );
+    oauth2.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+    return oauth2;
   }
-  const credentials = JSON.parse(
-    Buffer.from(process.env.GOOGLE_SERVICE_ACCOUNT_KEY, "base64").toString("utf-8")
-  );
-  return new google.auth.GoogleAuth({
-    credentials,
-    scopes: ["https://www.googleapis.com/auth/drive"],
-  });
+
+  // 서비스 계정 방식 (Shared Drive 전용)
+  if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
+    const credentials = JSON.parse(
+      Buffer.from(process.env.GOOGLE_SERVICE_ACCOUNT_KEY, "base64").toString("utf-8")
+    );
+    return new google.auth.GoogleAuth({
+      credentials,
+      scopes: ["https://www.googleapis.com/auth/drive"],
+    });
+  }
+
+  throw new Error("GOOGLE_REFRESH_TOKEN 또는 GOOGLE_SERVICE_ACCOUNT_KEY 환경 변수가 필요합니다.");
 }
 
 function getDrive() {

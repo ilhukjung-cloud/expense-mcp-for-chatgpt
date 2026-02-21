@@ -1091,6 +1091,46 @@ app.get("/health", (req, res) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// OAuth2 인증 (Refresh Token 발급용)
+// ---------------------------------------------------------------------------
+
+app.get("/auth", async (req, res) => {
+  const { google } = await import("googleapis");
+  const oauth2 = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    `https://expense-mcp-for-chatgpt.vercel.app/auth/callback`
+  );
+  const url = oauth2.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: ["https://www.googleapis.com/auth/drive"],
+  });
+  res.redirect(url);
+});
+
+app.get("/auth/callback", async (req, res) => {
+  try {
+    const { google } = await import("googleapis");
+    const oauth2 = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      `https://expense-mcp-for-chatgpt.vercel.app/auth/callback`
+    );
+    const { tokens } = await oauth2.getToken(req.query.code);
+    res.send(`
+      <h2>✅ 인증 성공!</h2>
+      <p>아래 Refresh Token을 복사해서 Vercel 환경변수 <strong>GOOGLE_REFRESH_TOKEN</strong>에 설정하세요:</p>
+      <textarea rows="4" cols="80" onclick="this.select()">${tokens.refresh_token}</textarea>
+      <br><br>
+      <p>설정 후 <code>vercel --prod</code>로 재배포하면 완료됩니다.</p>
+    `);
+  } catch (err) {
+    res.status(500).send(`인증 실패: ${err.message}`);
+  }
+});
+
 app.get("/test-drive", async (req, res) => {
   const result = { folder_id: process.env.GDRIVE_FOLDER_ID || "NOT SET", steps: [] };
   try {
