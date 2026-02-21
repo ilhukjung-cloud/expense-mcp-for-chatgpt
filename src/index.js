@@ -1072,16 +1072,10 @@ server.tool(
 // HTTP Server (ChatGPT Enterprise / Streamable HTTP)
 // ---------------------------------------------------------------------------
 
-if (!GDRIVE_BASE) {
-  console.error("Error: GDRIVE_BASE 환경 변수가 설정되지 않았습니다.");
-  console.error("예시: export GDRIVE_BASE='/Users/jay/Library/CloudStorage/GoogleDrive-.../내 드라이브'");
-  process.exit(1);
-}
-
 const app = express();
 
 app.use(cors({
-  origin: ["https://chatgpt.com", "https://chat.openai.com", "https://*.openai.com"],
+  origin: "*",
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["content-type", "authorization"],
 }));
@@ -1089,15 +1083,26 @@ app.use(cors({
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
-const transport = new StreamableHTTPServerTransport({
-  sessionIdGenerator: undefined, // stateless mode (ChatGPT Enterprise 권장)
-});
+// Lazy initialization (Vercel 서버리스 호환)
+let transport = null;
 
-await server.connect(transport);
+async function getTransport() {
+  if (!transport) {
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined, // stateless mode
+    });
+    await server.connect(transport);
+  }
+  return transport;
+}
 
 app.all("/mcp", async (req, res) => {
   try {
-    await transport.handleRequest(req, res);
+    if (!GDRIVE_BASE) {
+      return res.status(500).json({ error: "GDRIVE_BASE 환경 변수가 설정되지 않았습니다." });
+    }
+    const t = await getTransport();
+    await t.handleRequest(req, res);
   } catch (error) {
     console.error("MCP Error:", error);
     if (!res.headersSent) {
@@ -1107,11 +1112,20 @@ app.all("/mcp", async (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", name: "expense-mcp-server" });
+  res.json({
+    status: "ok",
+    name: "expense-mcp-server",
+    gdrive: GDRIVE_BASE ? "configured" : "NOT SET",
+  });
 });
 
-const PORT = process.env.PORT || 8787;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Expense MCP Server running → http://0.0.0.0:${PORT}/mcp`);
-  console.log(`✅ ChatGPT Enterprise 연결 준비 완료`);
-});
+// 로컬 실행 시에만 서버 시작 (Vercel은 export default app 사용)
+if (!process.env.VERCEL) {
+  const PORT = process.env.PORT || 8787;
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`🚀 Expense MCP Server running → http://0.0.0.0:${PORT}/mcp`);
+    console.log(`✅ ChatGPT Enterprise 연결 준비 완료`);
+  });
+}
+
+export default app;
