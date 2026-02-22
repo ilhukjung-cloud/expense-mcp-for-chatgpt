@@ -365,71 +365,55 @@ server.tool(
 
 // ---- 5. generate_pdf_report ------------------------------------------------
 
-server.tool(
-  "generate_pdf_report",
-  "월별 경비 PDF 보고서를 영수증 이미지와 함께 생성합니다",
-  {
-    year: z.number().describe("연도"),
-    month: z.number().describe("월"),
-    project: z.string().optional().describe("프로젝트명 (미입력 시 전체)"),
-  },
-  async ({ year, month, project }) => {
-    const all = await loadExpenses();
-    let filtered = all.filter((e) => {
-      const [ey, em] = e.date.split("-").map(Number);
-      return ey === year && em === month;
-    });
-    if (project) {
-      filtered = filtered.filter((e) => e.project === project);
+// 공통 헬퍼: receipts_folder 또는 expense.receipt_path 기반으로 영수증 HTML 생성
+async function buildReceiptImages(filtered, receiptsFolder) {
+  const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "bmp", "webp"];
+  const MIME_MAP = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", bmp: "image/bmp", webp: "image/webp" };
+  const receiptParts = [];
+
+  if (receiptsFolder) {
+    // reports/<receiptsFolder> 하위 이미지 전체를 순서대로 포함
+    const folderId = await driveApi.getFolderIdByPath(["reports", receiptsFolder]);
+    if (!folderId) {
+      return { html: `<p class="missing">폴더 'reports/${receiptsFolder}'를 찾을 수 없습니다. Google Drive에서 폴더명을 확인해 주세요.</p>`, count: 0 };
+    }
+    const files = await driveApi.listFilesInFolder(folderId);
+    const images = files.filter(f => IMAGE_EXTS.some(ext => f.name.toLowerCase().endsWith("." + ext)));
+
+    if (images.length === 0) {
+      return { html: `<p>폴더 'reports/${receiptsFolder}'에 이미지가 없습니다.</p>`, count: 0 };
     }
 
-    // Read HTML template
-    const templatePath = resolve(__dirname, "..", "templates", "report.html");
-    let html = await readFile(templatePath, "utf-8");
-
-    const totalAmount = filtered.reduce((s, e) => s + e.amount, 0);
-
-    // Build expense rows HTML
-    const expenseRows = filtered
-      .map(
-        (e, i) => `
-      <tr>
-        <td>${i + 1}</td>
-        <td>${e.date}</td>
-        <td>${e.merchant}</td>
-        <td class="amount">${formatAmount(e.amount)}</td>
-        <td>${e.business_number}</td>
-        <td>${e.category}</td>
-        <td>${e.notes}</td>
-      </tr>`
-      )
-      .join("\n");
-
-    // Build category summary HTML
-    const byCategory = {};
-    for (const e of filtered) {
-      if (!byCategory[e.category]) {
-        byCategory[e.category] = { count: 0, amount: 0 };
+    for (let i = 0; i < images.length; i++) {
+      const f = images[i];
+      const ext = f.name.split(".").pop().toLowerCase();
+      const mime = MIME_MAP[ext] || "image/jpeg";
+      try {
+        const buf = await driveApi.downloadFileAsBuffer(f.id);
+        const b64 = buf.toString("base64");
+        receiptParts.push(`
+        <div class="receipt">
+          <div class="receipt-header">
+            <span class="receipt-no">증빙 #${i + 1}</span>
+            <span class="receipt-info">${f.name}</span>
+            <span class="receipt-amount"></span>
+          </div>
+          <img src="data:${mime};base64,${b64}" alt="${f.name}" />
+        </div>`);
+      } catch {
+        receiptParts.push(`
+        <div class="receipt">
+          <div class="receipt-header">
+            <span class="receipt-no">증빙 #${i + 1}</span>
+            <span class="receipt-info">${f.name}</span>
+            <span class="receipt-amount"></span>
+          </div>
+          <p class="missing">이미지 로드 실패: ${f.name}</p>
+        </div>`);
       }
-      byCategory[e.category].count += 1;
-      byCategory[e.category].amount += e.amount;
     }
-
-    const categorySummary = Object.entries(byCategory)
-      .sort((a, b) => b[1].amount - a[1].amount)
-      .map(
-        ([cat, data]) => `
-      <tr>
-        <td>${cat}</td>
-        <td>${data.count}건</td>
-        <td class="amount">${formatAmount(data.amount)}</td>
-        <td>${totalAmount > 0 ? ((data.amount / totalAmount) * 100).toFixed(1) : "0.0"}%</td>
-      </tr>`
-      )
-      .join("\n");
-
-    // Build receipt images HTML as base64 data URIs
-    const receiptParts = [];
+  } else {
+    // expense.receipt_path 기반 (기존 방식)
     let receiptNo = 0;
     for (const e of filtered) {
       if (!e.receipt_path) continue;
@@ -439,14 +423,7 @@ server.tool(
         if (!imgFile) throw new Error("not found");
         const imgBuffer = await driveApi.downloadFileAsBuffer(imgFile.id);
         const ext = e.receipt_path.split(".").pop().toLowerCase();
-        const mime =
-          ext === "png"
-            ? "image/png"
-            : ext === "jpg" || ext === "jpeg"
-              ? "image/jpeg"
-              : ext === "gif"
-                ? "image/gif"
-                : "image/png";
+        const mime = MIME_MAP[ext] || "image/jpeg";
         const b64 = imgBuffer.toString("base64");
         receiptParts.push(`
         <div class="receipt">
@@ -469,12 +446,106 @@ server.tool(
         </div>`);
       }
     }
+  }
 
-    const receiptImages = receiptParts.length > 0
-      ? receiptParts.join("\n")
-      : "<p>첨부된 영수증이 없습니다.</p>";
+  return {
+    html: receiptParts.length > 0 ? receiptParts.join("\n") : "<p>첨부된 영수증이 없습니다.</p>",
+    count: receiptParts.length,
+  };
+}
 
-    // Replace template placeholders
+// 공통 헬퍼: Puppeteer로 HTML → PDF 생성 후 Drive 업로드
+async function generateAndUploadPdf(html, fileName) {
+  let browser;
+  if (process.env.VERCEL) {
+    const chromium = (await import("@sparticuz/chromium")).default;
+    browser = await puppeteerCore.launch({
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+    });
+  } else {
+    browser = await puppeteer.launch({ headless: true });
+  }
+  const page = await browser.newPage();
+  await page.setContent(html, { waitUntil: "networkidle0" });
+
+  const tmpPath = join(os.tmpdir(), fileName);
+  await page.pdf({
+    path: tmpPath,
+    format: "A4",
+    printBackground: true,
+    margin: { top: "15mm", right: "15mm", bottom: "15mm", left: "15mm" },
+  });
+  await browser.close();
+
+  const reportsFolderId = await driveApi.findOrCreateFolder("reports");
+  await driveApi.uploadLocalFile(tmpPath, fileName, "application/pdf", reportsFolderId);
+  return tmpPath;
+}
+
+server.tool(
+  "generate_pdf_report",
+  "월별 경비 PDF 보고서를 영수증 이미지와 함께 생성합니다",
+  {
+    year: z.number().describe("연도"),
+    month: z.number().describe("월"),
+    project: z.string().optional().describe("프로젝트명 (미입력 시 전체)"),
+    receipts_folder: z.string().optional().describe("영수증 폴더명 (Google Drive reports/ 하위 폴더. 예: '2월 영수증'). 지정 시 해당 폴더의 모든 이미지가 PDF에 포함됩니다."),
+  },
+  async ({ year, month, project, receipts_folder }) => {
+    const all = await loadExpenses();
+    let filtered = all.filter((e) => {
+      const [ey, em] = e.date.split("-").map(Number);
+      return ey === year && em === month;
+    });
+    if (project) {
+      filtered = filtered.filter((e) => e.project === project);
+    }
+
+    const templatePath = resolve(__dirname, "..", "templates", "report.html");
+    let html = await readFile(templatePath, "utf-8");
+
+    const totalAmount = filtered.reduce((s, e) => s + e.amount, 0);
+
+    const expenseRows = filtered
+      .map(
+        (e, i) => `
+      <tr>
+        <td>${i + 1}</td>
+        <td>${e.date}</td>
+        <td>${e.merchant}</td>
+        <td class="amount">${formatAmount(e.amount)}</td>
+        <td>${e.business_number}</td>
+        <td>${e.category}</td>
+        <td>${e.notes}</td>
+      </tr>`
+      )
+      .join("\n");
+
+    const byCategory = {};
+    for (const e of filtered) {
+      if (!byCategory[e.category]) byCategory[e.category] = { count: 0, amount: 0 };
+      byCategory[e.category].count += 1;
+      byCategory[e.category].amount += e.amount;
+    }
+
+    const categorySummary = Object.entries(byCategory)
+      .sort((a, b) => b[1].amount - a[1].amount)
+      .map(
+        ([cat, data]) => `
+      <tr>
+        <td>${cat}</td>
+        <td>${data.count}건</td>
+        <td class="amount">${formatAmount(data.amount)}</td>
+        <td>${totalAmount > 0 ? ((data.amount / totalAmount) * 100).toFixed(1) : "0.0"}%</td>
+      </tr>`
+      )
+      .join("\n");
+
+    const { html: receiptImages, count: receiptCount } = await buildReceiptImages(filtered, receipts_folder);
+
     html = html.replace(/\{\{YEAR\}\}/g, String(year));
     html = html.replace(/\{\{MONTH\}\}/g, String(month).padStart(2, "0"));
     html = html.replace(/\{\{TOTAL_AMOUNT\}\}/g, formatAmount(totalAmount));
@@ -484,38 +555,11 @@ server.tool(
     html = html.replace(/\{\{RECEIPT_IMAGES\}\}/g, receiptImages);
     html = html.replace(/\{\{GENERATION_DATE\}\}/g, new Date().toLocaleString("ko-KR"));
 
-    // Generate PDF (Vercel: @sparticuz/chromium, local: puppeteer)
-    let browser;
-    if (process.env.VERCEL) {
-      const chromium = (await import("@sparticuz/chromium")).default;
-      browser = await puppeteerCore.launch({
-        args: chromium.args,
-        defaultViewport: chromium.defaultViewport,
-        executablePath: await chromium.executablePath(),
-        headless: chromium.headless,
-      });
-    } else {
-      browser = await puppeteer.launch({ headless: true });
-    }
-    const page = await browser.newPage();
-    await page.setContent(html, { waitUntil: "networkidle0" });
-
     const mm = String(month).padStart(2, "0");
     const projectSuffix = project ? `_${project.replace(/\s+/g, "_")}` : "";
     const fileName = `${year}-${mm}${projectSuffix}_경비보고서.pdf`;
 
-    // /tmp에 생성 후 Drive 업로드
-    const tmpPath = join(os.tmpdir(), fileName);
-    await page.pdf({
-      path: tmpPath,
-      format: "A4",
-      printBackground: true,
-      margin: { top: "15mm", right: "15mm", bottom: "15mm", left: "15mm" },
-    });
-    await browser.close();
-
-    const reportsFolderId = await driveApi.findOrCreateFolder("reports");
-    await driveApi.uploadLocalFile(tmpPath, fileName, "application/pdf", reportsFolderId);
+    await generateAndUploadPdf(html, fileName);
 
     return {
       content: [
@@ -528,9 +572,11 @@ server.tool(
             `기간: ${year}년 ${month}월`,
             `건수: ${filtered.length}건`,
             `합계: ${formatAmount(totalAmount)}`,
-            receiptParts.length > 0
-              ? `영수증 이미지: ${receiptParts.length}장 포함`
-              : `영수증 이미지: 없음`,
+            receipts_folder
+              ? `영수증 폴더: reports/${receipts_folder} (${receiptCount}장 포함)`
+              : receiptCount > 0
+                ? `영수증 이미지: ${receiptCount}장 포함`
+                : `영수증 이미지: 없음`,
           ].join("\n"),
         },
       ],
@@ -544,13 +590,19 @@ server.tool(
   "list_receipt_images",
   "Google Drive 경비 폴더의 영수증 이미지 목록을 반환합니다",
   {
-    folder: z.string().optional().describe("폴더명 (예: '2월 경비'). 미입력 시 경비 관련 폴더 전체 검색"),
+    folder: z.string().optional().describe("폴더명 (예: '2월 경비') 또는 'reports/2월 영수증' 형식. 미입력 시 전체 검색"),
+    in_reports: z.boolean().optional().describe("true 시 reports/ 하위 폴더만 검색합니다 (영수증 폴더 확인용)"),
   },
-  async ({ folder }) => {
-    const imageExts = [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".pdf"];
+  async ({ folder, in_reports }) => {
+    const imageExts = [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".pdf", ".webp"];
 
     if (folder) {
-      const folderId = await driveApi.getFolderIdByName(folder);
+      // "reports/폴더명" 형식 지원
+      const parts = folder.split("/");
+      const folderId = parts.length >= 2
+        ? await driveApi.getFolderIdByPath(parts)
+        : await driveApi.getFolderIdByName(folder);
+
       if (!folderId) {
         return { content: [{ type: "text", text: `'${folder}' 폴더를 찾을 수 없습니다.` }], isError: true };
       }
@@ -560,29 +612,61 @@ server.tool(
       if (images.length === 0) {
         return { content: [{ type: "text", text: `'${folder}' 폴더에 이미지가 없습니다.` }] };
       }
-      const lines = images.map((f, i) => `${i + 1}. ${folder}/${f.name}`);
+      const lines = images.map((f, i) => `${i + 1}. ${f.name}`);
       return {
-        content: [{ type: "text", text: [`'${folder}' 폴더 이미지 (${images.length}개):`, "", ...lines].join("\n") }],
+        content: [{ type: "text", text: [`'${folder}' 폴더 이미지 (${images.length}개):`, "", ...lines, "", `💡 PDF 보고서 생성 시: receipts_folder: "${parts[parts.length - 1]}" 로 지정하세요.`].join("\n") }],
       };
     }
 
-    // 경비 관련 서브폴더 전체 검색
-    const subfolders = await driveApi.listSubfolders();
     const results = [];
 
-    for (const sf of subfolders) {
-      if (/경비|출장|영수증|비용/.test(sf.name)) {
-        const files = await driveApi.listFilesInFolder(sf.id);
-        const images = files.filter((f) => imageExts.some((ext) => f.name.toLowerCase().endsWith(ext)));
-        if (images.length > 0) {
-          results.push(`📁 ${sf.name}/ (${images.length}개)`);
-          for (const f of images) results.push(`   - ${sf.name}/${f.name}`);
+    if (in_reports) {
+      // reports/ 하위 폴더 검색
+      const reportsFolderId = await driveApi.getFolderIdByName("reports");
+      if (reportsFolderId) {
+        const subfolders = await driveApi.listSubfoldersInFolder(reportsFolderId);
+        for (const sf of subfolders) {
+          const files = await driveApi.listFilesInFolder(sf.id);
+          const images = files.filter((f) => imageExts.some((ext) => f.name.toLowerCase().endsWith(ext)));
+          if (images.length > 0) {
+            results.push(`📁 reports/${sf.name}/ (${images.length}개)`);
+            for (const f of images) results.push(`   - ${f.name}`);
+            results.push(`   💡 receipts_folder: "${sf.name}"`);
+            results.push("");
+          }
+        }
+      }
+    } else {
+      // 루트의 경비 관련 서브폴더 검색
+      const subfolders = await driveApi.listSubfolders();
+      for (const sf of subfolders) {
+        if (/경비|출장|영수증|비용/.test(sf.name)) {
+          const files = await driveApi.listFilesInFolder(sf.id);
+          const images = files.filter((f) => imageExts.some((ext) => f.name.toLowerCase().endsWith(ext)));
+          if (images.length > 0) {
+            results.push(`📁 ${sf.name}/ (${images.length}개)`);
+            for (const f of images) results.push(`   - ${sf.name}/${f.name}`);
+          }
+        }
+      }
+
+      // reports/ 하위도 함께 확인
+      const reportsFolderId = await driveApi.getFolderIdByName("reports");
+      if (reportsFolderId) {
+        const subfolders2 = await driveApi.listSubfoldersInFolder(reportsFolderId);
+        for (const sf of subfolders2) {
+          const files = await driveApi.listFilesInFolder(sf.id);
+          const images = files.filter((f) => imageExts.some((ext) => f.name.toLowerCase().endsWith(ext)));
+          if (images.length > 0) {
+            results.push(`📁 reports/${sf.name}/ (${images.length}개) ← PDF 생성 시 receipts_folder: "${sf.name}"`);
+            for (const f of images) results.push(`   - ${f.name}`);
+          }
         }
       }
     }
 
     if (results.length === 0) {
-      return { content: [{ type: "text", text: "경비 관련 폴더에서 이미지를 찾을 수 없습니다." }] };
+      return { content: [{ type: "text", text: "이미지를 찾을 수 없습니다.\n\n💡 Google Drive에서 reports/ 폴더 하위에 영수증 폴더를 만들고 이미지를 넣어주세요.\n예: reports/2월 영수증/" }] };
     }
     return {
       content: [{ type: "text", text: ["Google Drive 영수증 이미지:", "", ...results].join("\n") }],
@@ -941,15 +1025,15 @@ server.tool(
       },
       generate_pdf_report: {
         summary: "월별 PDF 경비 보고서를 생성합니다 (영수증 이미지 포함)",
-        params: "year(필수), month(필수), project(선택)",
-        example: "year: 2026, month: 2",
-        tips: "receipt_path가 설정된 경비만 영수증 이미지가 포함됩니다.",
+        params: "year(필수), month(필수), project(선택), receipts_folder(선택)",
+        example: "year: 2026, month: 2, receipts_folder: '2월 영수증'",
+        tips: "receipts_folder 지정 시 Google Drive reports/{폴더}의 모든 이미지가 PDF에 포함됩니다. 미지정 시 각 경비의 receipt_path 기준.",
       },
       list_receipt_images: {
         summary: "Google Drive의 영수증 이미지 목록을 조회합니다",
-        params: "folder(선택, 기본값: '{M}월 경비')",
-        example: "folder: '2월 경비'",
-        tips: "폴더 내 PNG, JPG, PDF 파일을 목록으로 보여줍니다.",
+        params: "folder(선택), in_reports(선택, true 시 reports/ 하위만 검색)",
+        example: "in_reports: true  또는  folder: 'reports/2월 영수증'",
+        tips: "in_reports: true 로 호출하면 PDF 생성 시 사용할 receipts_folder 값을 안내해 줍니다.",
       },
       save_receipt_image: {
         summary: "로컬 이미지 파일을 Google Drive 경비 폴더로 복사합니다",
@@ -1331,6 +1415,69 @@ app.post("/api/upload_receipt", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.post("/api/generate_pdf_report", async (req, res) => {
+  try {
+    const { year, month, project, receipts_folder } = req.body;
+    if (!year || !month) return res.status(400).json({ error: "year, month 는 필수입니다." });
+    const all = await loadExpenses();
+    let filtered = all.filter(e => { const [ey, em] = e.date.split("-").map(Number); return ey === Number(year) && em === Number(month); });
+    if (project) filtered = filtered.filter(e => e.project === project);
+
+    const templatePath = resolve(__dirname, "..", "templates", "report.html");
+    let html = await readFile(templatePath, "utf-8");
+    const totalAmount = filtered.reduce((s, e) => s + e.amount, 0);
+
+    const expenseRows = filtered.map((e, i) => `
+      <tr>
+        <td>${i + 1}</td><td>${e.date}</td><td>${e.merchant}</td>
+        <td class="amount">${formatAmount(e.amount)}</td>
+        <td>${e.business_number}</td><td>${e.category}</td><td>${e.notes}</td>
+      </tr>`).join("\n");
+
+    const byCategory = {};
+    for (const e of filtered) {
+      if (!byCategory[e.category]) byCategory[e.category] = { count: 0, amount: 0 };
+      byCategory[e.category].count += 1;
+      byCategory[e.category].amount += e.amount;
+    }
+    const categorySummary = Object.entries(byCategory)
+      .sort((a, b) => b[1].amount - a[1].amount)
+      .map(([cat, data]) => `
+      <tr>
+        <td>${cat}</td><td>${data.count}건</td>
+        <td class="amount">${formatAmount(data.amount)}</td>
+        <td>${totalAmount > 0 ? ((data.amount / totalAmount) * 100).toFixed(1) : "0.0"}%</td>
+      </tr>`).join("\n");
+
+    const { html: receiptImages, count: receiptCount } = await buildReceiptImages(filtered, receipts_folder);
+
+    html = html.replace(/\{\{YEAR\}\}/g, String(year));
+    html = html.replace(/\{\{MONTH\}\}/g, String(month).padStart(2, "0"));
+    html = html.replace(/\{\{TOTAL_AMOUNT\}\}/g, formatAmount(totalAmount));
+    html = html.replace(/\{\{TOTAL_COUNT\}\}/g, String(filtered.length));
+    html = html.replace(/\{\{EXPENSE_ROWS\}\}/g, expenseRows);
+    html = html.replace(/\{\{CATEGORY_SUMMARY\}\}/g, categorySummary);
+    html = html.replace(/\{\{RECEIPT_IMAGES\}\}/g, receiptImages);
+    html = html.replace(/\{\{GENERATION_DATE\}\}/g, new Date().toLocaleString("ko-KR"));
+
+    const mm = String(month).padStart(2, "0");
+    const suffix = project ? `_${project.replace(/\s+/g, "_")}` : "";
+    const fileName = `${year}-${mm}${suffix}_경비보고서.pdf`;
+
+    await generateAndUploadPdf(html, fileName);
+
+    res.json({
+      success: true,
+      file: `reports/${fileName}`,
+      count: filtered.length,
+      total_formatted: formatAmount(totalAmount),
+      receipts_folder: receipts_folder || null,
+      receipt_count: receiptCount,
+      message: `PDF 보고서가 Google Drive reports 폴더에 저장됐습니다. 영수증 ${receiptCount}장 포함.`,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post("/api/generate_excel_report", async (req, res) => {
   try {
     const { year, month, project } = req.body;
@@ -1500,6 +1647,20 @@ app.get("/openapi.json", (req, res) => {
             }}}}
           },
           responses: { "200": { description: "업로드 성공, receipt_path 반환" } }
+        }
+      },
+      "/api/generate_pdf_report": {
+        post: {
+          operationId: "generate_pdf_report",
+          summary: "PDF 보고서 생성 (영수증 포함)",
+          description: "월별 경비 PDF 보고서를 생성합니다. receipts_folder를 지정하면 Google Drive reports/ 하위 해당 폴더의 모든 이미지가 PDF에 포함됩니다.",
+          requestBody: { required: true, content: { "application/json": { schema: { type: "object", required: ["year","month"], properties: {
+            year: { type: "integer", description: "연도" },
+            month: { type: "integer", description: "월" },
+            project: { type: "string", description: "프로젝트명 (선택)" },
+            receipts_folder: { type: "string", description: "영수증 폴더명 (reports/ 하위. 예: '2월 영수증')" },
+          }}}}},
+          responses: { "200": { description: "보고서 생성 완료" } }
         }
       },
       "/api/generate_excel_report": {

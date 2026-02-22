@@ -249,3 +249,32 @@ export async function findFileByRelativePath(relativePath) {
   if (!folder) return null;
   return findItem(drive, folder.id, fileName);
 }
+
+// ---------------------------------------------------------------------------
+// 중첩 폴더 경로 탐색 (예: ["reports", "2월 영수증"] → folderId)
+// ---------------------------------------------------------------------------
+
+export async function getFolderIdByPath(pathParts) {
+  const drive = getDrive();
+  let currentId = rootId();
+  for (const part of pathParts) {
+    const folder = await findItem(
+      drive, currentId, part,
+      "application/vnd.google-apps.folder"
+    );
+    if (!folder) return null;
+    currentId = folder.id;
+  }
+  return currentId;
+}
+
+// reports/ 하위 서브폴더 목록 반환
+export async function listSubfoldersInFolder(folderId) {
+  const drive = getDrive();
+  const res = await drive.files.list({
+    q: `'${folderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+    fields: "files(id, name)",
+    pageSize: 100,
+  });
+  return res.data.files || [];
+}
