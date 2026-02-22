@@ -4,8 +4,11 @@
     {
       "src": "src/index.js",
       "use": "@vercel/node",
-      "config": { "maxLambdaSize": "50mb", "maxDuration": 60 }
+      "config": { "maxLambdaSize": "50mb" }
     }
   ],
+  "functions": {
+    "src/index.js": { "maxDuration": 300 }
+  },
   "routes": [{ "src": "/(.*)", "dest": "/src/index.js" }]
 }

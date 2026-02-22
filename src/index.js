@@ -389,14 +389,15 @@ async function buildReceiptImages(filtered, receiptsFolder) {
       return { html: `<p>폴더 '${folderLabel}'에 이미지가 없습니다.</p>`, count: 0 };
     }
 
-    for (let i = 0; i < images.length; i++) {
-      const f = images[i];
-      const ext = f.name.split(".").pop().toLowerCase();
-      const mime = MIME_MAP[ext] || "image/jpeg";
-      try {
-        const buf = await driveApi.downloadFileAsBuffer(f.id);
-        const b64 = buf.toString("base64");
-        receiptParts.push(`
+    // 병렬 다운로드
+    const downloadResults = await Promise.all(
+      images.map(async (f, i) => {
+        const ext = f.name.split(".").pop().toLowerCase();
+        const mime = MIME_MAP[ext] || "image/jpeg";
+        try {
+          const buf = await driveApi.downloadFileAsBuffer(f.id);
+          const b64 = buf.toString("base64");
+          return `
         <div class="receipt">
           <div class="receipt-header">
             <span class="receipt-no">증빙 #${i + 1}</span>
@@ -404,9 +405,9 @@ async function buildReceiptImages(filtered, receiptsFolder) {
             <span class="receipt-amount"></span>
           </div>
           <img src="data:${mime};base64,${b64}" alt="${f.name}" />
-        </div>`);
-      } catch {
-        receiptParts.push(`
+        </div>`;
+        } catch {
+          return `
         <div class="receipt">
           <div class="receipt-header">
             <span class="receipt-no">증빙 #${i + 1}</span>
@@ -414,23 +415,25 @@ async function buildReceiptImages(filtered, receiptsFolder) {
             <span class="receipt-amount"></span>
           </div>
           <p class="missing">이미지 로드 실패: ${f.name}</p>
-        </div>`);
-      }
-    }
+        </div>`;
+        }
+      })
+    );
+    receiptParts.push(...downloadResults);
   } else {
-    // expense.receipt_path 기반 (기존 방식)
-    let receiptNo = 0;
-    for (const e of filtered) {
-      if (!e.receipt_path) continue;
-      receiptNo++;
-      try {
-        const imgFile = await driveApi.findFileByRelativePath(e.receipt_path);
-        if (!imgFile) throw new Error("not found");
-        const imgBuffer = await driveApi.downloadFileAsBuffer(imgFile.id);
-        const ext = e.receipt_path.split(".").pop().toLowerCase();
-        const mime = MIME_MAP[ext] || "image/jpeg";
-        const b64 = imgBuffer.toString("base64");
-        receiptParts.push(`
+    // expense.receipt_path 기반 (병렬 다운로드)
+    const expensesWithReceipt = filtered.filter(e => e.receipt_path);
+    const downloadResults = await Promise.all(
+      expensesWithReceipt.map(async (e, i) => {
+        const receiptNo = i + 1;
+        try {
+          const imgFile = await driveApi.findFileByRelativePath(e.receipt_path);
+          if (!imgFile) throw new Error("not found");
+          const imgBuffer = await driveApi.downloadFileAsBuffer(imgFile.id);
+          const ext = e.receipt_path.split(".").pop().toLowerCase();
+          const mime = MIME_MAP[ext] || "image/jpeg";
+          const b64 = imgBuffer.toString("base64");
+          return `
         <div class="receipt">
           <div class="receipt-header">
             <span class="receipt-no">증빙 #${receiptNo}</span>
@@ -438,9 +441,9 @@ async function buildReceiptImages(filtered, receiptsFolder) {
             <span class="receipt-amount">${formatAmount(e.amount)}</span>
           </div>
           <img src="data:${mime};base64,${b64}" alt="${e.merchant} 영수증" />
-        </div>`);
-      } catch {
-        receiptParts.push(`
+        </div>`;
+        } catch {
+          return `
         <div class="receipt">
           <div class="receipt-header">
             <span class="receipt-no">증빙 #${receiptNo}</span>
@@ -448,9 +451,11 @@ async function buildReceiptImages(filtered, receiptsFolder) {
             <span class="receipt-amount">${formatAmount(e.amount)}</span>
           </div>
           <p class="missing">영수증 이미지를 찾을 수 없습니다: ${e.receipt_path}</p>
-        </div>`);
-      }
-    }
+        </div>`;
+        }
+      })
+    );
+    receiptParts.push(...downloadResults);
   }
 
   return {
