@@ -372,16 +372,21 @@ async function buildReceiptImages(filtered, receiptsFolder) {
   const receiptParts = [];
 
   if (receiptsFolder) {
-    // reports/<receiptsFolder> 하위 이미지 전체를 순서대로 포함
-    const folderId = await driveApi.getFolderIdByPath(["reports", receiptsFolder]);
+    // 1순위: reports/<receiptsFolder>, 2순위: 루트/<receiptsFolder>
+    let folderId = await driveApi.getFolderIdByPath(["reports", receiptsFolder]);
+    let folderLabel = `reports/${receiptsFolder}`;
     if (!folderId) {
-      return { html: `<p class="missing">폴더 'reports/${receiptsFolder}'를 찾을 수 없습니다. Google Drive에서 폴더명을 확인해 주세요.</p>`, count: 0 };
+      folderId = await driveApi.getFolderIdByName(receiptsFolder);
+      folderLabel = receiptsFolder;
+    }
+    if (!folderId) {
+      return { html: `<p class="missing">폴더 '${receiptsFolder}'를 찾을 수 없습니다. Google Drive에서 폴더명을 확인해 주세요.</p>`, count: 0 };
     }
     const files = await driveApi.listFilesInFolder(folderId);
     const images = files.filter(f => IMAGE_EXTS.some(ext => f.name.toLowerCase().endsWith("." + ext)));
 
     if (images.length === 0) {
-      return { html: `<p>폴더 'reports/${receiptsFolder}'에 이미지가 없습니다.</p>`, count: 0 };
+      return { html: `<p>폴더 '${folderLabel}'에 이미지가 없습니다.</p>`, count: 0 };
     }
 
     for (let i = 0; i < images.length; i++) {
@@ -590,8 +595,7 @@ server.tool(
   "list_receipt_images",
   "Google Drive 경비 폴더의 영수증 이미지 목록을 반환합니다",
   {
-    folder: z.string().optional().describe("폴더명 (예: '2월 경비') 또는 'reports/2월 영수증' 형식. 미입력 시 전체 검색"),
-    in_reports: z.boolean().optional().describe("true 시 reports/ 하위 폴더만 검색합니다 (영수증 폴더 확인용)"),
+    folder: z.string().optional().describe("폴더명 (예: '2월 경비'). 미입력 시 이미지가 있는 모든 폴더 검색"),
   },
   async ({ folder, in_reports }) => {
     const imageExts = [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".pdf", ".webp"];
@@ -620,53 +624,35 @@ server.tool(
 
     const results = [];
 
-    if (in_reports) {
-      // reports/ 하위 폴더 검색
-      const reportsFolderId = await driveApi.getFolderIdByName("reports");
-      if (reportsFolderId) {
-        const subfolders = await driveApi.listSubfoldersInFolder(reportsFolderId);
-        for (const sf of subfolders) {
-          const files = await driveApi.listFilesInFolder(sf.id);
-          const images = files.filter((f) => imageExts.some((ext) => f.name.toLowerCase().endsWith(ext)));
-          if (images.length > 0) {
-            results.push(`📁 reports/${sf.name}/ (${images.length}개)`);
-            for (const f of images) results.push(`   - ${f.name}`);
-            results.push(`   💡 receipts_folder: "${sf.name}"`);
-            results.push("");
-          }
-        }
+    // 루트의 모든 서브폴더 검색 (이미지가 있는 폴더만)
+    const subfolders = await driveApi.listSubfolders();
+    for (const sf of subfolders) {
+      const files = await driveApi.listFilesInFolder(sf.id);
+      const images = files.filter((f) => imageExts.some((ext) => f.name.toLowerCase().endsWith(ext)));
+      if (images.length > 0) {
+        results.push(`📁 ${sf.name}/ (${images.length}개) ← receipts_folder: "${sf.name}"`);
+        for (const f of images) results.push(`   - ${f.name}`);
+        results.push("");
       }
-    } else {
-      // 루트의 경비 관련 서브폴더 검색
-      const subfolders = await driveApi.listSubfolders();
-      for (const sf of subfolders) {
-        if (/경비|출장|영수증|비용/.test(sf.name)) {
-          const files = await driveApi.listFilesInFolder(sf.id);
-          const images = files.filter((f) => imageExts.some((ext) => f.name.toLowerCase().endsWith(ext)));
-          if (images.length > 0) {
-            results.push(`📁 ${sf.name}/ (${images.length}개)`);
-            for (const f of images) results.push(`   - ${sf.name}/${f.name}`);
-          }
-        }
-      }
+    }
 
-      // reports/ 하위도 함께 확인
-      const reportsFolderId = await driveApi.getFolderIdByName("reports");
-      if (reportsFolderId) {
-        const subfolders2 = await driveApi.listSubfoldersInFolder(reportsFolderId);
-        for (const sf of subfolders2) {
-          const files = await driveApi.listFilesInFolder(sf.id);
-          const images = files.filter((f) => imageExts.some((ext) => f.name.toLowerCase().endsWith(ext)));
-          if (images.length > 0) {
-            results.push(`📁 reports/${sf.name}/ (${images.length}개) ← PDF 생성 시 receipts_folder: "${sf.name}"`);
-            for (const f of images) results.push(`   - ${f.name}`);
-          }
+    // reports/ 하위 서브폴더도 검색
+    const reportsFolderId = await driveApi.getFolderIdByName("reports");
+    if (reportsFolderId) {
+      const subfolders2 = await driveApi.listSubfoldersInFolder(reportsFolderId);
+      for (const sf of subfolders2) {
+        const files = await driveApi.listFilesInFolder(sf.id);
+        const images = files.filter((f) => imageExts.some((ext) => f.name.toLowerCase().endsWith(ext)));
+        if (images.length > 0) {
+          results.push(`📁 reports/${sf.name}/ (${images.length}개) ← receipts_folder: "${sf.name}"`);
+          for (const f of images) results.push(`   - ${f.name}`);
+          results.push("");
         }
       }
     }
 
     if (results.length === 0) {
-      return { content: [{ type: "text", text: "이미지를 찾을 수 없습니다.\n\n💡 Google Drive에서 reports/ 폴더 하위에 영수증 폴더를 만들고 이미지를 넣어주세요.\n예: reports/2월 영수증/" }] };
+      return { content: [{ type: "text", text: "이미지가 있는 폴더를 찾을 수 없습니다.\n\n💡 Google Drive에 영수증 이미지가 담긴 폴더가 있는지 확인해 주세요." }] };
     }
     return {
       content: [{ type: "text", text: ["Google Drive 영수증 이미지:", "", ...results].join("\n") }],
