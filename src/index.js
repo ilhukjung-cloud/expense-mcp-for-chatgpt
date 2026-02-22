@@ -1294,25 +1294,40 @@ app.delete("/api/expense/:id", async (req, res) => {
 app.post("/api/upload_receipt", async (req, res) => {
   try {
     const { data, filename, folder } = req.body;
-    if (!data || !filename) return res.status(400).json({ error: "data(base64), filename 은 필수입니다." });
+    if (!filename) return res.status(400).json({ error: "filename 은 필수입니다." });
+    if (!data) return res.status(400).json({ error: "data(base64 이미지) 는 필수입니다." });
 
     const now = new Date();
     const targetFolder = folder || `${now.getMonth() + 1}월 경비`;
 
-    // base64 → Buffer
+    // base64 헤더 제거 (data:image/jpeg;base64, 형식 지원)
     const base64Clean = data.replace(/^data:[^;]+;base64,/, "");
     const buffer = Buffer.from(base64Clean, "base64");
 
     // 확장자로 MIME 타입 결정
     const ext = filename.split(".").pop().toLowerCase();
-    const mimeMap = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", pdf: "application/pdf", heic: "image/heic" };
+    const mimeMap = {
+      png: "image/png",
+      jpg: "image/jpeg", jpeg: "image/jpeg",
+      gif: "image/gif",
+      pdf: "application/pdf",
+      heic: "image/heic", heif: "image/heif",
+      webp: "image/webp",
+      bmp: "image/bmp",
+    };
     const mimeType = mimeMap[ext] || "image/jpeg";
 
     const folderId = await driveApi.findOrCreateFolder(targetFolder);
     await driveApi.uploadBuffer(buffer, filename, mimeType, folderId);
 
     const receipt_path = `${targetFolder}/${filename}`;
-    res.json({ success: true, receipt_path, folder: targetFolder, message: `영수증 저장 완료. save_expense 호출 시 receipt_path: "${receipt_path}" 사용` });
+    res.json({
+      success: true,
+      receipt_path,
+      folder: targetFolder,
+      filename,
+      message: `영수증이 Google Drive '${targetFolder}' 폴더에 저장됐습니다. save_expense 호출 시 receipt_path: "${receipt_path}" 를 사용하세요.`,
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1323,17 +1338,65 @@ app.post("/api/generate_excel_report", async (req, res) => {
     const all = await loadExpenses();
     let filtered = all.filter(e => { const [ey, em] = e.date.split("-").map(Number); return ey === Number(year) && em === Number(month); });
     if (project) filtered = filtered.filter(e => e.project === project);
+
     const wb = XLSX.utils.book_new();
-    const wsDetail = XLSX.utils.json_to_sheet(filtered.map(e => ({ 날짜: e.date, 가맹점: e.merchant, 금액: e.amount, 분류: e.category, 비고: e.notes })));
+
+    // --- 경비내역 시트 ---
+    const detailData = filtered.map(e => ({
+      날짜: e.date,
+      가맹점: e.merchant,
+      금액: e.amount,
+      사업자등록번호: e.business_number,
+      분류: e.category,
+      프로젝트: e.project,
+      비고: e.notes,
+    }));
+    const wsDetail = XLSX.utils.json_to_sheet(detailData);
+    wsDetail["!cols"] = [{ wch: 12 }, { wch: 25 }, { wch: 15 }, { wch: 18 }, { wch: 12 }, { wch: 20 }, { wch: 20 }];
     XLSX.utils.book_append_sheet(wb, wsDetail, "경비내역");
+
+    // --- 분류별요약 시트 ---
+    const byCategory = {};
+    for (const e of filtered) {
+      if (!byCategory[e.category]) byCategory[e.category] = { count: 0, amount: 0 };
+      byCategory[e.category].count += 1;
+      byCategory[e.category].amount += e.amount;
+    }
+    const totalAmount = filtered.reduce((s, e) => s + e.amount, 0);
+    const summaryData = Object.entries(byCategory)
+      .sort((a, b) => b[1].amount - a[1].amount)
+      .map(([cat, d]) => ({
+        분류: cat,
+        건수: d.count,
+        금액: d.amount,
+        "비율(%)": totalAmount > 0 ? Number(((d.amount / totalAmount) * 100).toFixed(1)) : 0,
+      }));
+    summaryData.push({ 분류: "합계", 건수: filtered.length, 금액: totalAmount, "비율(%)": 100 });
+    const wsSummary = XLSX.utils.json_to_sheet(summaryData);
+    wsSummary["!cols"] = [{ wch: 15 }, { wch: 10 }, { wch: 15 }, { wch: 10 }];
+    XLSX.utils.book_append_sheet(wb, wsSummary, "분류별요약");
+
     const mm = String(month).padStart(2, "0");
     const suffix = project ? `_${project.replace(/\s+/g, "_")}` : "";
     const fileName = `${year}-${mm}${suffix}_경비보고서.xlsx`;
     const tmpPath = join(os.tmpdir(), fileName);
     XLSX.writeFile(wb, tmpPath);
+
     const folderId = await driveApi.findOrCreateFolder("reports");
-    await driveApi.uploadLocalFile(tmpPath, fileName, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", folderId);
-    res.json({ success: true, file: `reports/${fileName}`, count: filtered.length, total_formatted: formatAmount(filtered.reduce((s, e) => s + e.amount, 0)) });
+    await driveApi.uploadLocalFile(
+      tmpPath, fileName,
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      folderId
+    );
+
+    res.json({
+      success: true,
+      file: `reports/${fileName}`,
+      count: filtered.length,
+      total_formatted: formatAmount(totalAmount),
+      sheets: ["경비내역", "분류별요약"],
+      message: `Excel 보고서가 Google Drive reports 폴더에 저장됐습니다.`,
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
