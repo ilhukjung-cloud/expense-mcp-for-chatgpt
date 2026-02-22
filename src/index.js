@@ -8,6 +8,7 @@ import { z } from "zod";
 import { v4 as uuidv4 } from "uuid";
 import * as XLSX from "xlsx";
 import puppeteer from "puppeteer";
+import puppeteerCore from "puppeteer-core";
 import { readFile } from "fs/promises";
 import { join, dirname, resolve } from "path";
 import { fileURLToPath } from "url";
@@ -483,8 +484,19 @@ server.tool(
     html = html.replace(/\{\{RECEIPT_IMAGES\}\}/g, receiptImages);
     html = html.replace(/\{\{GENERATION_DATE\}\}/g, new Date().toLocaleString("ko-KR"));
 
-    // Generate PDF with puppeteer
-    const browser = await puppeteer.launch({ headless: true });
+    // Generate PDF (Vercel: @sparticuz/chromium, local: puppeteer)
+    let browser;
+    if (process.env.VERCEL) {
+      const chromium = (await import("@sparticuz/chromium")).default;
+      browser = await puppeteerCore.launch({
+        args: chromium.args,
+        defaultViewport: chromium.defaultViewport,
+        executablePath: await chromium.executablePath(),
+        headless: chromium.headless,
+      });
+    } else {
+      browser = await puppeteer.launch({ headless: true });
+    }
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: "networkidle0" });
 
@@ -1278,6 +1290,32 @@ app.delete("/api/expense/:id", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 영수증 이미지 업로드 (base64)
+app.post("/api/upload_receipt", async (req, res) => {
+  try {
+    const { data, filename, folder } = req.body;
+    if (!data || !filename) return res.status(400).json({ error: "data(base64), filename 은 필수입니다." });
+
+    const now = new Date();
+    const targetFolder = folder || `${now.getMonth() + 1}월 경비`;
+
+    // base64 → Buffer
+    const base64Clean = data.replace(/^data:[^;]+;base64,/, "");
+    const buffer = Buffer.from(base64Clean, "base64");
+
+    // 확장자로 MIME 타입 결정
+    const ext = filename.split(".").pop().toLowerCase();
+    const mimeMap = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", pdf: "application/pdf", heic: "image/heic" };
+    const mimeType = mimeMap[ext] || "image/jpeg";
+
+    const folderId = await driveApi.findOrCreateFolder(targetFolder);
+    await driveApi.uploadBuffer(buffer, filename, mimeType, folderId);
+
+    const receipt_path = `${targetFolder}/${filename}`;
+    res.json({ success: true, receipt_path, folder: targetFolder, message: `영수증 저장 완료. save_expense 호출 시 receipt_path: "${receipt_path}" 사용` });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post("/api/generate_excel_report", async (req, res) => {
   try {
     const { year, month, project } = req.body;
@@ -1383,6 +1421,22 @@ app.get("/openapi.json", (req, res) => {
           summary: "경비 삭제",
           parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
           responses: { "200": { description: "삭제 성공" } }
+        }
+      },
+      "/api/upload_receipt": {
+        post: {
+          operationId: "upload_receipt",
+          summary: "영수증 이미지 업로드",
+          description: "base64 인코딩된 영수증 이미지를 Google Drive에 저장합니다. 반환된 receipt_path를 save_expense에 사용하세요.",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { type: "object", required: ["data","filename"], properties: {
+              data: { type: "string", description: "base64 인코딩된 이미지 데이터 (data:image/... 포함 가능)" },
+              filename: { type: "string", description: "저장할 파일명 (예: receipt_001.jpg)" },
+              folder: { type: "string", description: "저장 폴더명 (기본: 현재월 경비)" },
+            }}}}
+          },
+          responses: { "200": { description: "업로드 성공, receipt_path 반환" } }
         }
       },
       "/api/generate_excel_report": {
